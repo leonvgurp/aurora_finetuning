@@ -1,0 +1,20 @@
+# All paths resolve relative to this file. No credentials belong here.
+root = ".."
+north = 56.5
+south = 47.5
+west = -2.5
+east = 12.5
+resolution = 0.25
+hours = 8
+device = "mps"
+seed = 42
+max_steps = 20
+learning_rate = 0.0001
+# Fixed physical loss scales, chosen before evaluation (not fitted on test data).
+temperature_scale = 5.0
+precipitation_scale = 1.0
+max_input_age_hours = 12
+max_memory_gb = 12.0
+# Pin the official 1.5 checkpoint and matching static asset revision.
+checkpoint_revision = "a96afd7ee6d65e3bd2d476f3be798a25a56f2296"
+training_head = "surface"

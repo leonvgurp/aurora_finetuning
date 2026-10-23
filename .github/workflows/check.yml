@@ -15,3 +15,4 @@ jobs:
       - run: pixi install --locked
       - run: pixi run check
       - run: pixi run smoke
+      - run: pixi run smoke-architecture
