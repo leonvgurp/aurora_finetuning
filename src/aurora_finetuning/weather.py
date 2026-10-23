@@ -118,6 +118,7 @@ def predict_weather(
     start: datetime | None = None,
     now: datetime | None = None,
     adapter: Path | None = None,
+    radar_adapter: Path | None = None,
 ) -> dict[str, object]:
     """Retrieve fresh inputs, reuse or generate a regional forecast, then query it."""
     validate_location(latitude, longitude)
@@ -171,6 +172,20 @@ def predict_weather(
             save_forecast(dataset, path)
             write_json(path.with_suffix(".json"), {"sha256": sha256(path), "key": key})
     result = query_grid(dataset, latitude, longitude, config.hours, start)
+    if radar_adapter is not None:
+        from aurora_finetuning.radar_model import apply_live_radar
+
+        result = apply_live_radar(
+            result,
+            dataset,
+            radar_adapter,
+            config,
+            recorder,
+            now,
+            latitude,
+            longitude,
+            adapter,
+        )
     result["initialization_age_hours"] = (
         now.astimezone(UTC).replace(tzinfo=None) - cycle
     ).total_seconds() / 3600

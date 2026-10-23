@@ -27,8 +27,17 @@ class Config:
     max_memory_gb: float = 12.0
     checkpoint_revision: str = "a96afd7ee6d65e3bd2d476f3be798a25a56f2296"
     training_head: str = "surface"
+    radar_patch_size: int = 192
+    radar_wet_weight: float = 4.0
+    radar_max_age_minutes: int = 20
 
     def __post_init__(self) -> None:
+        if not 1 <= self.radar_max_age_minutes <= 60:
+            raise ValueError("radar_max_age_minutes must be between 1 and 60")
+        if not 128 <= self.radar_patch_size <= 256:
+            raise ValueError("radar_patch_size must be between 128 and 256 pixels")
+        if not math.isfinite(self.radar_wet_weight) or self.radar_wet_weight < 1:
+            raise ValueError("radar_wet_weight must be finite and at least one")
         if not all(
             math.isfinite(v)
             for v in (

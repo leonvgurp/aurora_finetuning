@@ -1,0 +1,23 @@
+{
+  "train": [
+    {
+      "initialization": "2024-01-01T06:00:00",
+      "forecast": "../outputs/radar-base-train.nc",
+      "radar": "../data/prepared/radar/train.nc"
+    }
+  ],
+  "validation": [
+    {
+      "initialization": "2024-07-01T06:00:00",
+      "forecast": "../outputs/radar-base-validation.nc",
+      "radar": "../data/prepared/radar/validation.nc"
+    }
+  ],
+  "test": [
+    {
+      "initialization": "2024-09-01T06:00:00",
+      "forecast": "../outputs/radar-base-test.nc",
+      "radar": "../data/prepared/radar/test.nc"
+    }
+  ]
+}

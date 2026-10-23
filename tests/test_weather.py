@@ -423,3 +423,77 @@ def test_cli_provider_failure_has_no_stdout(
     assert captured.out == ""
     assert "provider progress" in captured.err
     assert json.loads(report.read_text())["success"] is False
+
+
+def test_weather_passes_trained_radar_adapter_and_keeps_table(
+    live_fixture: tuple[Config, datetime, list[int]],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    config, cycle, _ = live_fixture
+    config_path = config.root / "config.toml"
+    config_path.write_text('root = "."\nhours = 1\ndevice = "cpu"\n')
+    supplied: list[Path] = []
+    original_predict = weather.predict_weather
+
+    def predict(
+        c: Config,
+        lat: float,
+        lon: float,
+        recorder: Recorder,
+        *,
+        start: datetime | None,
+        adapter: Path | None,
+        radar_adapter: Path | None = None,
+    ) -> dict[str, object]:
+        return original_predict(
+            c,
+            lat,
+            lon,
+            recorder,
+            now=cycle.replace(tzinfo=UTC),
+            start=start,
+            adapter=adapter,
+            radar_adapter=radar_adapter,
+        )
+
+    def refine(
+        result: dict[str, object],
+        forecast: xr.Dataset,
+        path: Path,
+        c: Config,
+        recorder: Recorder,
+        now: datetime,
+        lat: float,
+        lon: float,
+        base_adapter: Path | None,
+    ) -> dict[str, object]:
+        supplied.append(path)
+        assert forecast.sizes["time"] == 1
+        rows = result["hourly"]
+        assert isinstance(rows, list)
+        rows[0]["precipitation_mm"] = 2.345
+        return result
+
+    monkeypatch.setattr(weather, "predict_weather", predict)
+    monkeypatch.setattr("aurora_finetuning.radar_model.apply_live_radar", refine)
+    checkpoint = config.root / "radar.pt"
+    assert (
+        main(
+            [
+                "weather",
+                "--latitude",
+                "52",
+                "--longitude",
+                "5",
+                "--config",
+                str(config_path),
+                "--radar-adapter",
+                str(checkpoint),
+            ]
+        )
+        == 0
+    )
+    assert supplied == [checkpoint]
+    output = capsys.readouterr().out
+    assert output.startswith("| Hour ending") and "2.345" in output

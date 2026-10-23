@@ -211,6 +211,103 @@ and inputs. Test cases are not consumed by training. The backbone stays frozen;
 this adapts output heads, not regional atmospheric dynamics. The four example
 cases and 20 steps are a smoke-sized pilot, not a sufficient scientific dataset.
 
+## Fine-tuning rainfall with measured radar
+
+The radar-conditioned rain adapter uses **both** past measured radar as an input
+and subsequent measured radar as training targets. It keeps Aurora frozen and
+trains a small convolutional rain decoder alongside it. Temperature still comes
+from Aurora. No KNMI forecast or nowcast is used.
+
+Each example supplies 24 measured five-minute frames ending at its UTC cutoff
+(two hours of history), an existing Aurora gridded forecast, and the following
+72 measured frames (six hours of targets). Radar stays on its native **1 km**
+projected grid. The decoder sees the radar history, explicit missing-data masks,
+Aurora rainfall mapped to that grid, forecast lead and atmospheric input age.
+It predicts five-minute amounts; these are summed into the hourly output table.
+An untrained zero residual reproduces Aurora's rainfall; learned changes require
+a trained checkpoint. This is parameter-efficient adaptation, not retraining
+Aurora's atmospheric dynamics.
+
+Use measured five-minute RTCOR accumulation HDF5 frames from KNMI's
+[real-time radar/gauge dataset](https://dataplatform.knmi.nl/dataset/nl-rdr-data-rtcor-5m-1-0).
+Its [archive](https://dataplatform.knmi.nl/dataset/nl-rdr-data-rtcor-5m-tar-1-0)
+provides older observations; archive extraction is manual. Do not use the
+`radar_forecast` dataset. Geolocation comes from the file's explicit projection
+and pixel metadata, following the
+[KNMI HDF5 specification](https://cdn.knmi.nl/system/data_center_publications/files/000/072/301/original/hdftag38.pdf).
+Pixi supplies pyproj/PROJ through conda-forge for coordinate conversion.
+Keep the original `RAD_NL25_RAC_RT_YYYYMMDDhhmm.h5` filenames. Other products,
+including retrospectively gauge-adjusted climatological radar, are rejected as
+conditioning inputs to avoid using corrections unavailable at prediction time.
+Historical RTCOR files preserve the real-time product, although their actual
+publication latency is not reconstructed by the training sampler.
+
+Prepare each case separately, using exactly its 96 consecutive observed frames:
+
+```sh
+# Replace the input directory with the measured frames for one case.
+pixi run prepare-radar-native --frames path/to/observed-case/*.h5 --latitude 52.1 --longitude 5.4 --size 256 --output data/prepared/radar/train.nc
+```
+
+The default is a 192 × 192 km patch around the supplied point; `--size 256` retains
+a wider area so training can sample different 192 km patches. Only cropped
+arrays are retained in memory; no more than 128 frames can be prepared in one
+command. Missing measurements stay missing, including KNMI's distinct missing
+and out-of-image codes. Forecast products, unexpected calibration, inconsistent
+grids and time gaps fail explicitly.
+
+Edit `configs/radar-cases.example.json` to point to your train, validation and
+test data. Paths resolve relative to that JSON file. `initialization` is the
+radar observation cutoff: naive UTC on a five-minute boundary. Each `radar` path
+contains the native prepared data; each `forecast` path contains the Aurora
+NetCDF covering all target hours. Generate those forecasts with the existing
+retrieval/preparation workflow and `pixi run hindcast`; for exact-hour cases,
+six forecast hours suffice. A non-hour cutoff can require seven hourly outputs.
+The baseline forecast must start at/before the cutoff, no more than 12 hours
+earlier. The example dates are placeholders; their data are not included.
+
+```sh
+pixi run train-radar --cases configs/radar-cases.example.json --steps 1 --output outputs/radar-smoke
+# Use a fresh output directory for a longer, configured pilot:
+pixi run train-radar --cases configs/radar-cases.example.json --output outputs/radar-pilot
+pixi run evaluate-radar-adapter --cases configs/radar-cases.example.json --radar-adapter outputs/radar-pilot/best.pt
+pixi run weather Leusden --hours 8 --radar-adapter outputs/radar-pilot/best.pt
+```
+
+Training samples native-grid patches and five-minute leads from 5 to 360 minutes.
+It optimizes a wet-weighted log-intensity loss (`radar_wet_weight`, default 4),
+excludes missing labels, and selects `best.pt` on validation loss. The six dilated
+convolutional layers have a 127 km receptive field; loss is computed only in the
+patch interior, excluding padding effects. The default 192 km patch leaves a
+66 × 66 km verification interior. Splits need more than 30 hours separation;
+training never opens held-out test files. Prefer many independent storms and
+seasonal splits over repeated patches from one event.
+
+Validation uses the central patch at six fixed leads; the separate test command
+scores every five-minute lead and hourly/six-hour accumulations on the central
+patch interior, against Aurora and measured-radar persistence. This is sampled
+spatial verification, not a nationwide accuracy assessment. `training.json`,
+checkpoint hashes and timing reports retain data/configuration provenance.
+Keep `best.pt` and its companion `best.json` together. If baseline forecasts used
+an Aurora surface-head adapter, pass that same file with `--adapter` to training,
+evaluation and weather prediction; checkpoint compatibility is verified.
+
+At prediction time, `--radar-adapter` downloads/reuses only the last 24 measured
+frames using your existing KNMI key. The latest measurement must be no older than
+`radar_max_age_minutes` (default 20); missing/stale history fails rather than
+silently switching modes. The elapsed part of the first hour uses measured rain,
+and its remaining five-minute bins use the trained decoder. Complete hourly
+intervals ending within six hours of the radar cutoff use the decoder; later
+rows retain Aurora rainfall. Per-row sources, the radar cutoff and adapter hash
+are recorded in the provenance report; stdout remains just the table.
+
+**Status:** native-grid decoding, live measured-history retrieval and the
+small-model CPU training/inference path are tested. A separate two-step MPS
+forward/backward smoke check also passed with finite gradients. No
+radar-conditioned checkpoint has yet been trained and validated on a
+representative set of real storms. The example smoke step is not sufficient for
+useful rain-band prediction, and 1 km output spacing does not establish 1 km skill.
+
 ## Locality, time and design choices
 
 Edit [configs/default.toml](configs/default.toml). Explicit CLI arguments override
@@ -261,9 +358,10 @@ command requires coordinates; `weather` also accepts place names.
   ERA5 alone is delayed. The explicit research commands remain available:
   `pull-ifs --initialization UTC_CYCLE --audit-only`, `pull-sea-ice`, then
   `pull-ifs --sea-ice FILE`. Downloads can be global before cropping.
-- **Optional radar:** `prepare-radar` needs individual five-minute HDF5 frames
-  plus authoritative matching geolocation; `evaluate --radar FILE` scores hourly
-  aggregates. Archive extraction and radar training are not implemented.
+- **Radar:** `prepare-radar` plus `evaluate --radar FILE` retain the original
+  coarse-grid scoring workflow. `prepare-radar-native`, `train-radar` and
+  `evaluate-radar-adapter` provide native-grid measured-history training and
+  validation. Archive extraction remains manual.
 - KNMI temperature is at 1.5 m versus model 2 m. Documented rain traces map to zero;
   other negative observations remain missing. Model rain is floored at zero with
   raw diagnostics retained; nonfinite outputs fail. ERA5/IFS assimilate

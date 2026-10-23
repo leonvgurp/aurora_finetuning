@@ -43,6 +43,11 @@ def parser() -> argparse.ArgumentParser:
     weather.add_argument("--hours", type=int)
     weather.add_argument("--start", type=datetime.fromisoformat)
     weather.add_argument("--adapter", type=Path)
+    weather.add_argument(
+        "--radar-adapter",
+        type=Path,
+        help="Trained native-grid radar rain adapter; uses measured KNMI history",
+    )
     setup = commands.add_parser(
         "weather-setup",
         parents=[common],
@@ -145,6 +150,29 @@ def parser() -> argparse.ArgumentParser:
     training.add_argument("--cases", type=Path, required=True)
     training.add_argument("--output", type=Path, required=True)
     training.add_argument("--steps", type=int)
+    native = commands.add_parser("prepare-radar-native", parents=[common])
+    native.add_argument("--frames", type=Path, nargs="+", required=True)
+    native.add_argument("--latitude", type=float, required=True)
+    native.add_argument("--longitude", type=float, required=True)
+    native.add_argument(
+        "--size",
+        type=int,
+        help="Native patch width in km (128–256); defaults to radar_patch_size",
+    )
+    native.add_argument("--output", type=Path, required=True)
+    for name in ("train-radar", "evaluate-radar-adapter"):
+        command = commands.add_parser(name, parents=[common])
+        command.add_argument("--cases", type=Path, required=True)
+        command.add_argument(
+            "--adapter",
+            type=Path,
+            help="Aurora surface-head adapter used for baseline forecasts",
+        )
+        if name == "train-radar":
+            command.add_argument("--output", type=Path, required=True)
+            command.add_argument("--steps", type=int)
+        else:
+            command.add_argument("--radar-adapter", type=Path, required=True)
     training.add_argument(
         "--stations",
         type=Path,
@@ -188,6 +216,7 @@ def dispatch(args: argparse.Namespace, config: Config, recorder: Recorder) -> ob
             location.latitude,
             location.longitude,
         )
+        kwargs = {"radar_adapter": args.radar_adapter} if args.radar_adapter else {}
         return predict_weather(
             config,
             location.latitude,
@@ -195,6 +224,35 @@ def dispatch(args: argparse.Namespace, config: Config, recorder: Recorder) -> ob
             recorder,
             start=args.start,
             adapter=args.adapter,
+            **kwargs,
+        )
+    if args.command == "prepare-radar-native":
+        from aurora_finetuning.model import save_forecast
+        from aurora_finetuning.radar_data import native_radar
+
+        if args.output.exists():
+            raise FileExistsError(args.output)
+        with recorder.measure("radar.prepare_native"):
+            dataset = native_radar(
+                args.frames,
+                recorder,
+                latitude=args.latitude,
+                longitude=args.longitude,
+                size=config.radar_patch_size if args.size is None else args.size,
+            )
+            save_forecast(dataset, args.output)
+        return {"radar": str(args.output)}
+    if args.command == "train-radar":
+        from aurora_finetuning.radar_training import train_radar
+
+        return train_radar(
+            config, args.cases, args.output, recorder, args.steps, args.adapter
+        )
+    if args.command == "evaluate-radar-adapter":
+        from aurora_finetuning.radar_training import evaluate_adapter
+
+        return evaluate_adapter(
+            config, args.cases, args.radar_adapter, recorder, args.adapter
         )
     if args.command == "download-model":
         from aurora_finetuning.assets import download_assets
@@ -328,6 +386,11 @@ def dispatch(args: argparse.Namespace, config: Config, recorder: Recorder) -> ob
                 recorder,
             )
             if args.command == "hindcast":
+                from aurora_finetuning.acquisition import sha256
+
+                ds.attrs["adapter_sha256"] = (
+                    sha256(args.adapter) if args.adapter else ""
+                )
                 with recorder.measure("forecast.write_netcdf"):
                     save_forecast(ds, args.output)
                 return {"forecast": str(args.output), "hours": ds.sizes["time"]}

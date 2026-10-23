@@ -39,6 +39,7 @@ cdsapi = ">=0.7.7,<0.8"
 h5py = ">=3.16.0,<4"
 eccodes = ">=2.50.0,<3"
 libopenblas = { version = "*", build = "*pthreads*" }
+pyproj = ">=3.7,<4"
 
 [tool.pixi.pypi-dependencies]
 aurora-finetuning = { path = ".", editable = true }
@@ -55,6 +56,9 @@ default = { features = ["dev"], solve-group = "default" }
 [tool.pixi.tasks]
 weather = "aurora-finetuning weather --config configs/default.toml"
 weather-setup = "aurora-finetuning weather-setup --config configs/default.toml"
+prepare-radar-native = "aurora-finetuning prepare-radar-native --config configs/default.toml"
+train-radar = "aurora-finetuning train-radar --config configs/default.toml"
+evaluate-radar-adapter = "aurora-finetuning evaluate-radar-adapter --config configs/default.toml"
 format = "ruff format ."
 format-check = "ruff format --check ."
 lint = "ruff check ."

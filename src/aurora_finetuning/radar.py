@@ -41,6 +41,9 @@ def decode_frame(path: Path) -> tuple[datetime, FloatArray]:
         values = raw * scale + offset
         nodata = float(np.asarray(calibration["calibration_out_of_image"]).item())
         values[raw == nodata] = np.nan
+        if "calibration_missing_data" in calibration:
+            missing = float(np.asarray(calibration["calibration_missing_data"]).item())
+            values[raw == missing] = np.nan
         values[values < 0] = np.nan
         timestamp = text_attribute(handle["overview"].attrs["product_datetime_end"])
         time = datetime.strptime(timestamp, "%d-%b-%Y;%H:%M:%S.000")
