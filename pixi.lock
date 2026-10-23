@@ -515,7 +515,7 @@ packages:
 - pypi: ./
   name: aurora-finetuning
   version: 0.1.0
-  sha256: ecaebd60c8468600340aa89b8f0c1188a1b294a0481936263c70e9b2b32f3cf5
+  sha256: 119d884570f0e9405f900d9bd2e2627d038bb5c1d9a3bbd581ebad10c6952547
   requires_dist:
   - microsoft-aurora @ git+https://github.com/microsoft/aurora.git@85dd3880683f0ac19aa8fe4386c5dcacfec99892
   - requests>=2.32,<3

@@ -11,7 +11,7 @@ from ecmwf.opendata import Client
 from aurora_finetuning.acquisition import LEVELS, SURFACE, http_session, sha256
 from aurora_finetuning.config import Config
 from aurora_finetuning.grid import make_grid
-from aurora_finetuning.preparation import canonical, subset
+from aurora_finetuning.preparation import canonical, require_units, subset
 from aurora_finetuning.telemetry import Recorder, write_json
 
 IFS_SURFACE = {
@@ -34,6 +34,54 @@ IFS_SURFACE = {
     "siconc": "siconc",
     "sd": "sd",
 }
+
+
+def regional_grib_field(dataset: xr.Dataset) -> xr.Dataset:
+    """Remove per-field scalar axes while retaining atmospheric level dimensions."""
+    for name in ("depthBelowLandLayer", "soilLayer"):
+        if name in dataset.dims:
+            if dataset.sizes[name] != 1:
+                raise ValueError("IFS soil request must contain only the first layer")
+            dataset = dataset.isel({name: 0}, drop=True)
+    if "isobaricInhPa" in dataset.dims:
+        dataset = dataset.rename({"isobaricInhPa": "level"})
+    dataset = canonical(dataset)
+    return dataset.drop_vars(
+        [name for name in dataset.coords if name not in dataset.dims and name != "time"]
+    )
+
+
+def validate_ifs_units(dataset: xr.Dataset, kind: str) -> None:
+    """Require complete inputs in physical units compatible with Aurora/ERA5."""
+    wind = {"m s**-1", "m s-1", "m/s"}
+    fraction = {"1", "(0 - 1)"}
+    if kind == "single":
+        units = {
+            **dict.fromkeys(("t2m", "d2m", "skt", "stl1"), {"K"}),
+            **dict.fromkeys(("msl", "sp"), {"Pa"}),
+            **dict.fromkeys(("u10", "v10", "u100", "v100"), wind),
+            **dict.fromkeys(("tcc", "lcc", "mcc", "hcc", "siconc"), fraction),
+            "tcwv": {"kg m**-2", "kg m-2", "kg/m2"},
+            "swvl1": {"m**3 m**-3", "m3 m-3", "m3/m3"},
+            "sd": {"m of water equivalent", "m"},
+        }
+    else:
+        units = {
+            "t": {"K"},
+            "u": wind,
+            "v": wind,
+            "q": {"kg kg**-1", "kg kg-1", "kg/kg"},
+            "z": {"m**2 s**-2", "m2 s-2", "m^2 s^-2"},
+        }
+        if "level" not in dataset.coords or not set(LEVELS) <= set(
+            dataset.level.values
+        ):
+            raise ValueError("IFS input is missing required pressure levels")
+    missing = set(units) - set(dataset.data_vars)
+    if missing:
+        raise ValueError(f"IFS input is missing required fields: {sorted(missing)}")
+    for name, allowed in units.items():
+        require_units(dataset[name], allowed)
 
 
 def audit_ifs(initialization: datetime, recorder: Recorder) -> dict[str, object]:
@@ -126,7 +174,7 @@ def pull_ifs(
             f"Public IFS fields are incomplete for Aurora 1.5: {audit['cycles']}. "
             "No GRIB fields were downloaded; do not fabricate missing fields."
         )
-    client = Client(source="ecmwf", model="ifs", resol="0p25")
+    client: Client | None = None
     grid = make_grid(config)
     results: list[Path] = []
     for time in (initialization - timedelta(hours=6), initialization):
@@ -144,6 +192,7 @@ def pull_ifs(
                     raise ValueError(f"Incomplete or modified IFS cache: {path}")
                 with xr.open_dataset(path) as existing:
                     subset(existing, grid)
+                    validate_ifs_units(existing, kind)
                 results.append(path)
                 continue
             root.mkdir(parents=True, exist_ok=True)
@@ -180,6 +229,8 @@ def pull_ifs(
                 }
                 grib_paths.append(path.with_suffix(".soil.grib2"))
             with recorder.measure(f"download.ifs.{time.isoformat()}.{kind}"):
+                if client is None:
+                    client = Client(source="ecmwf", model="ifs", resol="0p25")
                 client.retrieve(request, target=str(grib))
                 if soil_request is not None:
                     client.retrieve(soil_request, target=str(grib_paths[1]))
@@ -194,17 +245,10 @@ def pull_ifs(
                 ]
                 for ds in datasets:
                     try:
-                        if "depthBelowLandLayer" in ds.dims:
-                            ds = ds.isel(depthBelowLandLayer=0)
-                        if "soilLayer" in ds.dims:
-                            ds = ds.isel(soilLayer=0)
-                        ds = ds.rename(
-                            {"isobaricInhPa": "level"}
-                            if "isobaricInhPa" in ds.dims
-                            else {}
-                        )
-                        ds = canonical(ds)
-                        chunks.append(subset(ds, grid).load())
+                        # Height/depth describe each variable, not a shared axis.
+                        # Keeping scalar 2/10/100 m coordinates makes xr.merge
+                        # reject otherwise compatible surface fields.
+                        chunks.append(subset(regional_grib_field(ds), grid).load())
                     finally:
                         ds.close()
                 merged = xr.merge(chunks, compat="no_conflicts")
@@ -237,6 +281,7 @@ def pull_ifs(
                 merged.attrs.update(
                     source="ECMWF IFS step-zero cycles", experimental="true"
                 )
+                validate_ifs_units(merged, kind)
                 merged.to_netcdf(path)
                 write_json(
                     manifest,

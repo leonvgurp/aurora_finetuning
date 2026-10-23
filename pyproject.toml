@@ -53,6 +53,8 @@ types-requests = ">=2.33.0.20261006,<3"
 default = { features = ["dev"], solve-group = "default" }
 
 [tool.pixi.tasks]
+weather = "aurora-finetuning weather --config configs/default.toml"
+weather-setup = "aurora-finetuning weather-setup --config configs/default.toml"
 format = "ruff format ."
 format-check = "ruff format --check ."
 lint = "ruff check ."

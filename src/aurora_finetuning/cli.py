@@ -3,7 +3,9 @@
 import argparse
 import json
 import logging
+import sys
 from collections.abc import Sequence
+from contextlib import redirect_stdout
 from dataclasses import asdict
 from datetime import UTC, date, datetime
 from importlib.metadata import version
@@ -32,6 +34,21 @@ def parser() -> argparse.ArgumentParser:
         "--report", type=Path, help="Exclusive timing/provenance JSON output"
     )
     commands = root.add_subparsers(dest="command")
+    weather = commands.add_parser(
+        "weather", parents=[common], help="Predict hourly weather for a Dutch locality"
+    )
+    weather.add_argument("locality", nargs="?")
+    weather.add_argument("--latitude", type=float)
+    weather.add_argument("--longitude", type=float)
+    weather.add_argument("--hours", type=int)
+    weather.add_argument("--start", type=datetime.fromisoformat)
+    weather.add_argument("--adapter", type=Path)
+    setup = commands.add_parser(
+        "weather-setup",
+        parents=[common],
+        help="Install assets and validate live inputs",
+    )
+    setup.add_argument("--sea-ice-date", type=date.fromisoformat)
     commands.add_parser(
         "download-model", parents=[common], help="Download pinned Aurora 1.5 assets"
     )
@@ -151,6 +168,34 @@ def parser() -> argparse.ArgumentParser:
 
 def dispatch(args: argparse.Namespace, config: Config, recorder: Recorder) -> object:
     """Dispatch only the selected command, keeping heavy imports lazy."""
+    if args.command == "weather-setup":
+        from aurora_finetuning.weather import setup_weather
+
+        return setup_weather(config, recorder, args.sea_ice_date)
+    if args.command == "weather":
+        from aurora_finetuning.locations import resolve_location
+        from aurora_finetuning.weather import predict_weather
+
+        location = resolve_location(
+            args.locality,
+            args.latitude,
+            args.longitude,
+            config.root / "data/cache/locations",
+        )
+        logging.info(
+            "Locality: %s (%s, %s)",
+            location.name,
+            location.latitude,
+            location.longitude,
+        )
+        return predict_weather(
+            config,
+            location.latitude,
+            location.longitude,
+            recorder,
+            start=args.start,
+            adapter=args.adapter,
+        )
     if args.command == "download-model":
         from aurora_finetuning.assets import download_assets
 
@@ -372,6 +417,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     result: object = None
     try:
         config = load_config(args.config)
+        report = (
+            report
+            or config.root / "outputs/timings" / f"{args.command}-{uuid4().hex}.json"
+        )
+        if report.exists():
+            raise FileExistsError(report)
         if args.device is not None:
             from dataclasses import replace
 
@@ -380,16 +431,23 @@ def main(argv: Sequence[str] | None = None) -> int:
             from dataclasses import replace
 
             config = replace(config, hours=args.hours)
-        report = (
-            report
-            or config.root / "outputs/timings" / f"{args.command}-{uuid4().hex}.json"
-        )
-        if report.exists():
-            raise FileExistsError(report)
         with recorder.measure(f"command.{args.command}"):
-            result = dispatch(args, config, recorder)
+            if args.command in ("weather", "weather-setup"):
+                # Provider/model libraries may print progress directly to stdout.
+                with redirect_stdout(sys.stderr):
+                    result = dispatch(args, config, recorder)
+            else:
+                result = dispatch(args, config, recorder)
+        if args.command == "weather":
+            from aurora_finetuning.table import format_table
+
+            if not isinstance(result, dict):
+                raise ValueError("Invalid weather result")
+            output = format_table(result)
+        else:
+            output = json.dumps(result, indent=2, allow_nan=False)
         success = True
-        print(json.dumps(result, indent=2, allow_nan=False))
+        print(output)
         return 0
     except (ValueError, FileNotFoundError, FileExistsError, PermissionError) as error:
         logging.error("%s", error)

@@ -6,9 +6,9 @@ and how well they would work. This is a first draft of that experiment: use a
 globally pretrained model on a region surrounding the Netherlands, compare its
 predictions with KNMI observations, and try limited local fine-tuning.
 
-The current starting point is an **eight-hour historical forecast** with hourly
-temperature and precipitation amounts. It runs locally; useful forecast skill and
-reliable forecasts for today are still open questions.
+The project provides historical experiments and a **one-command live forecast**
+with hourly temperature and precipitation amounts. Inference runs locally;
+useful forecast skill and operational reliability remain open questions.
 
 ## Requirements
 
@@ -80,7 +80,68 @@ need no personal token.
 pixi run providers             # Check CDS authentication and KNMI file listing
 ```
 
-## Workflow
+## One-command weather prediction
+
+After `pixi install --locked`, configure CDS credentials and accept the dataset
+terms above, then run the one-time setup:
+
+```sh
+pixi run weather-setup
+pixi run weather Utrecht --hours 8
+pixi run weather --latitude 52.09 --longitude 5.12 --hours 24
+```
+
+Run these commands from this checkout. Setup verifies/downloads pinned model
+assets, selects a fresh public IFS input pair and obtains a regional ERA5 sea-ice
+supplement. CDS credentials are needed for that supplement; KNMI credentials are
+not needed for weather predictions. Setup validates input fields, units and
+pressure levels; a successful prediction separately establishes model execution.
+Setup defaults to a supplement five days before today to allow for ERA5 delay;
+use `pixi run weather-setup --sea-ice-date YYYY-MM-DD` to specify the date used
+when a new supplement is needed.
+Both input states must be within seven days of the supplement.
+
+`weather` accepts a Dutch place name or a coordinate pair within the supported
+Netherlands envelope. Names resolve to locality centroids through
+[PDOK](https://www.pdok.nl/pdok-locatieserver), with cached lookups. Ambiguous names
+fail with candidates; refine the name or use coordinates. Locality lookup data
+is cached under `data/cache/locations/`; remove a lookup file to refresh it.
+
+The default is the next eight hourly predictions; `--hours` accepts 1–24. Optional
+`--start 2026-10-24T08:00:00+02:00` requests a future starting time. Results begin
+at the first whole UTC hour strictly after the requested start. Live starts must
+not be in the past, and initialization-to-final-output must fit the model's
+48-hour internal limit. All rows include local dates and UTC offsets, including
+across daylight-saving transitions.
+
+Successful stdout contains only a Markdown table:
+
+| Hour ending (Europe/Amsterdam) | Temperature (°C) | Rainfall (mm/hour) |
+|---|---:|---:|
+| 2026-10-23 22:00+02:00 | 11.72 | 0.155 |
+
+Temperature is the value at the hour ending; rainfall is the amount during the
+preceding hour, not its probability. The grid resolution is about 25 km, not
+street-level. Progress, resolved locality, initialization age and experimental
+warnings go to stderr; redirect stdout to save only the table. Errors return a
+nonzero exit status and no partial table.
+
+Prediction automatically selects the newest published, complete IFS input pair
+within `max_input_age_hours` (default 12). It reuses verified inputs and forecasts
+under `outputs/weather/`, including across localities and shorter requests.
+Uncached input downloads and model loading take longer than cached queries.
+Internet access is still needed to check current input availability. If the
+sea-ice supplement expires, rerun `pixi run weather-setup`; prediction never
+queues a CDS renewal or silently uses stale/fabricated inputs. Timing/provenance
+reports are saved under `outputs/timings/`. `--adapter PATH` explicitly selects
+trained heads; the default uses the pretrained model.
+
+A one-hour live Utrecht prediction completed on MPS on 23 October 2026 in
+47.4 seconds after setup, including model loading and eight internal lead hours
+to bridge the age of the available IFS cycle. This establishes execution for one
+case, not forecast accuracy or guaranteed provider availability.
+
+## Research workflow
 
 Each execution step has a Pixi task. Run the steps below in order and stop on
 failure. Tasks accept additional CLI arguments and do not automatically trigger
@@ -167,7 +228,7 @@ relative to that file; explicit CLI paths resolve from the working directory.
 | `max_steps`, `learning_rate`, `seed` | 20, 0.0001, 42 | Bounded head adaptation and best-effort reproducibility |
 | Loss scales | 5°C temperature, 1 mm precipitation | Fixed scaling; rainfall loss uses `log1p`; optional KNMI loss has equal weight to gridded loss |
 | `max_memory_gb` | 12 | Post-stage process RSS guard, not an OS limit or total GPU/unified-memory cap |
-| `max_input_age_hours` | 12 | Reject stale/future initialization relative to query start |
+| `max_input_age_hours` | 12 | Live input age is measured against now; research queries use their start |
 
 Coarser 0.5°/1° grids are configurable experiments, not validated equivalents of
 the native checkpoint. Start with 0.25° and reduce the region/horizon before
@@ -179,7 +240,8 @@ Initializations are exact UTC hours without a timezone suffix. Query `--start`
 requires a timezone; results show Amsterdam offsets. Temperature is bilinearly
 interpolated; rain uses the nearest grid cell and reports **mm over the preceding
 hour**, not probability. Location queries accept the NL bounding envelope
-50.7–53.7°N, 3.2–7.3°E, including some sea/border cells; no geocoding is provided.
+50.7–53.7°N, 3.2–7.3°E, including some sea/border cells. The research `forecast`
+command requires coordinates; `weather` also accepts place names.
 
 ## Outputs and remaining limits
 
@@ -188,16 +250,17 @@ hour**, not probability. Location queries accept the NL bounding envelope
   RSS, GPU allocation snapshots, configuration and hashes. Use new result paths;
   verified input caches are reusable.
 - Forecast NetCDF variables: `temperature_c`, `precipitation_mm`. Location queries
-  return JSON. Python interface: `aurora_finetuning.forecast.forecast(...)`, run
+  through `forecast` return JSON; `weather` prints a table. Python interface:
+  `aurora_finetuning.forecast.forecast(...)`, run
   through `pixi run python`.
 - Three-day history: `pixi run history --stations FILES --station WIGOS_ID
   --today YYYY-MM-DD`. Download all three days first. Returns hourly-sample
   temperature min/max/mean, sunshine/rain duration and coverage; incomplete totals
   stay null. This is separate from forecasting.
-- **Today:** ERA5 is delayed. `pull-ifs --initialization UTC_CYCLE --audit-only`
-  checks public IFS fields. A known sea-ice gap needs an explicit, age-checked
-  supplement (`pull-sea-ice`, then `pull-ifs --sea-ice FILE`). Downloads can be
-  global before cropping. `forecast --source ifs` is not yet fully validated.
+- **Today:** `weather` orchestrates live IFS inputs and age-checked sea ice;
+  ERA5 alone is delayed. The explicit research commands remain available:
+  `pull-ifs --initialization UTC_CYCLE --audit-only`, `pull-sea-ice`, then
+  `pull-ifs --sea-ice FILE`. Downloads can be global before cropping.
 - **Optional radar:** `prepare-radar` needs individual five-minute HDF5 frames
   plus authoritative matching geolocation; `evaluate --radar FILE` scores hourly
   aggregates. Archive extraction and radar training are not implemented.
@@ -213,8 +276,9 @@ model load/transfer; forecast computation took **7.87 s**. GPU driver allocation
 snapshots reached **5.23 GiB**, not a measured total-memory peak. Across this one
 case, temperature MAE was **0.982°C** versus **0.527°C** for persistence; rain MAE
 was **0.292 mm** versus **0.286 mm** for always dry. These results establish
-execution, not useful skill. Fine-tuned held-out performance and live operation
-remain to be demonstrated. Local detailed reports, when generated, are under
+execution, not useful skill. Fine-tuned held-out performance and sustained live
+reliability remain to be demonstrated. Local detailed reports, when generated,
+are under
 `outputs/performance/`; they are not included in a fresh checkout.
 
 ```sh
