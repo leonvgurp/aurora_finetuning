@@ -9,9 +9,14 @@ description = "Research on Aurora weather forecasting with KNMI observations"
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
 dependencies = [
-    "microsoft-aurora>=1.7,<2",
+    "microsoft-aurora @ git+https://github.com/microsoft/aurora.git@85dd3880683f0ac19aa8fe4386c5dcacfec99892",
     "requests>=2.32,<3",
     "xarray>=2025.1,<2027",
+    "numpy",
+    "torch>=2.11.0,<3",
+    "huggingface-hub>=2.2.0,<3",
+    "ecmwf-opendata>=0.3.35,<0.4",
+    "cfgrib>=0.9.15.1,<0.10", "zarr>=3.4.1,<4", "gcsfs>=2026.10.1,<2027",
 ]
 
 [project.scripts]
@@ -20,6 +25,9 @@ aurora-finetuning = "aurora_finetuning.cli:main"
 [tool.hatch.build.targets.wheel]
 packages = ["src/aurora_finetuning"]
 
+[tool.hatch.metadata]
+allow-direct-references = true
+
 [tool.pixi.workspace]
 channels = ["conda-forge"]
 platforms = ["osx-arm64", "linux-64"]
@@ -27,6 +35,10 @@ platforms = ["osx-arm64", "linux-64"]
 [tool.pixi.dependencies]
 python = "3.12.*"
 netcdf4 = ">=1.7,<2"
+cdsapi = ">=0.7.7,<0.8"
+h5py = ">=3.16.0,<4"
+eccodes = ">=2.50.0,<3"
+libopenblas = { version = "*", build = "*pthreads*" }
 
 [tool.pixi.pypi-dependencies]
 aurora-finetuning = { path = ".", editable = true }
@@ -35,6 +47,7 @@ aurora-finetuning = { path = ".", editable = true }
 ruff = ">=0.14,<1"
 mypy = ">=1.18,<2"
 pytest = ">=8,<10"
+types-requests = ">=2.33.0.20261006,<3"
 
 [tool.pixi.environments]
 default = { features = ["dev"], solve-group = "default" }
@@ -45,8 +58,27 @@ format-check = "ruff format --check ."
 lint = "ruff check ."
 typecheck = "mypy src tests"
 test = "pytest"
+test-integration = "pytest -m integration"
 check = { depends-on = ["format-check", "lint", "typecheck", "test"] }
-smoke = "python -c 'from aurora import AuroraSmallPretrained, Batch, Metadata; import torch, requests, xarray, netCDF4; print(\"Aurora and KNMI dependencies import successfully; PyTorch\", torch.__version__)'"
+smoke = "aurora-finetuning smoke --kind environment --config configs/default.toml"
+smoke-architecture = "aurora-finetuning smoke --kind architecture --device cpu --config configs/default.toml"
+providers = "aurora-finetuning smoke --kind providers --config configs/default.toml"
+download-model = "aurora-finetuning download-model --config configs/default.toml"
+pull-era5 = "aurora-finetuning pull-cds --config configs/default.toml"
+pull-arco-pressure = "aurora-finetuning pull-arco-pressure --config configs/default.toml"
+pull-knmi = "aurora-finetuning pull-knmi --config configs/default.toml"
+prepare = "aurora-finetuning prepare --config configs/default.toml"
+smoke-weights = "aurora-finetuning smoke --kind weights --config configs/default.toml"
+smoke-model = "aurora-finetuning smoke --kind model --config configs/default.toml"
+smoke-backward = "aurora-finetuning smoke --kind model --backward --config configs/default.toml"
+hindcast = "aurora-finetuning hindcast --config configs/default.toml"
+evaluate = "aurora-finetuning evaluate --config configs/default.toml"
+train = "aurora-finetuning train --config configs/default.toml"
+forecast = "aurora-finetuning forecast --config configs/default.toml"
+history = "aurora-finetuning history --config configs/default.toml"
+pull-ifs = "aurora-finetuning pull-ifs --config configs/default.toml"
+pull-sea-ice = "aurora-finetuning pull-sea-ice --config configs/default.toml"
+prepare-radar = "aurora-finetuning prepare-radar --config configs/default.toml"
 
 [tool.ruff]
 line-length = 88
@@ -59,6 +91,13 @@ select = ["E", "F", "I", "UP", "B"]
 python_version = "3.12"
 strict = true
 
+# These provider/model libraries ship no typing marker. Keep the exception at
+# the dependency boundary; all project code remains under strict checking.
+[[tool.mypy.overrides]]
+module = ["aurora.*", "cdsapi", "h5py", "cfgrib", "ecmwf.*"]
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-ra"
+addopts = "-ra -m 'not integration'"
+markers = ["integration: opt-in model or external-service checks"]
