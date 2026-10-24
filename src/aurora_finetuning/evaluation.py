@@ -75,6 +75,20 @@ def evaluate_stations(
                 np.asarray(stations.temperature_c.sel(time=init).values),
                 np.asarray(o.temperature_c[index].values),
             )
+        for variable in ("pressure_hpa", "wind_u_ms", "wind_v_ms"):
+            if variable not in p or variable not in o:
+                continue
+            sampled = p[variable].interp(
+                latitude=stations.latitude, longitude=stations.longitude
+            )
+            row[variable] = metrics(
+                np.asarray(sampled[index].values), np.asarray(o[variable][index].values)
+            )
+            if init in stations.time.values and variable in stations:
+                row[f"{variable}_persistence"] = metrics(
+                    np.asarray(stations[variable].sel(time=init).values),
+                    np.asarray(o[variable][index].values),
+                )
         output.append(row)
     return {
         "by_lead_hour": output,

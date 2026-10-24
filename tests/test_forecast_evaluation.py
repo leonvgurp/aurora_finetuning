@@ -11,7 +11,6 @@ import xarray as xr
 from aurora_finetuning.cli import main
 from aurora_finetuning.evaluation import metrics
 from aurora_finetuning.forecast import forecast, query_grid
-from aurora_finetuning.training import read_cases
 
 
 def prediction() -> xr.Dataset:
@@ -87,21 +86,6 @@ def test_metrics_ignore_missing_pairs() -> None:
     assert scores["count"] == 2
     assert scores["mae"] == 1.5
     assert scores["bias"] == 0.5
-
-
-def test_training_split_leakage_rejected(tmp_path: Path) -> None:
-    path = tmp_path / "cases.json"
-    path.write_text(
-        json.dumps(
-            {
-                "train": ["2024-01-01T06:00:00"],
-                "validation": ["2024-01-02T06:00:00"],
-                "test": ["2024-02-01T06:00:00"],
-            }
-        )
-    )
-    with pytest.raises(ValueError, match="separation"):
-        read_cases(path)
 
 
 def test_precipitation_floor_keeps_raw_diagnostics() -> None:

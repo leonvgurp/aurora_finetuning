@@ -289,7 +289,6 @@ def live_fixture(
     assets = tmp_path / "checkpoints/base/assets.json"
     write_json(assets, {"revision": config.checkpoint_revision})
     monkeypatch.setattr(weather, "audit_ifs", lambda *args: audit_result())
-    monkeypatch.setattr(weather, "verify_assets", lambda *args: {})
     monkeypatch.setattr(weather, "pull_ifs", lambda *args: [])
     monkeypatch.setattr(
         "aurora_finetuning.preparation.static_fields",
@@ -297,7 +296,14 @@ def live_fixture(
             "lsm": torch.zeros(make_grid(c).shape),
         },
     )
-    monkeypatch.setattr(weather, "load_model", lambda *args: None)
+
+    class FrozenModel:
+        def requires_grad_(self, enabled: bool) -> None:
+            assert not enabled
+
+    monkeypatch.setattr(
+        "aurora_finetuning.engine.load_model", lambda *args: FrozenModel()
+    )
     calls: list[int] = []
 
     def infer(
@@ -307,7 +313,7 @@ def live_fixture(
         calls.append(hours)
         return grid_forecast(cycle, hours)
 
-    monkeypatch.setattr(weather, "infer", infer)
+    monkeypatch.setattr("aurora_finetuning.engine.infer", infer)
     return config, cycle, calls
 
 
@@ -497,3 +503,19 @@ def test_weather_passes_trained_radar_adapter_and_keeps_table(
     assert supplied == [checkpoint]
     output = capsys.readouterr().out
     assert output.startswith("| Hour ending") and "2.345" in output
+
+
+def test_cache_hit_does_not_prepare_tensors_or_audit_network(
+    live_fixture: tuple[Config, datetime, list[int]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config, cycle, calls = live_fixture
+    now = cycle.replace(tzinfo=UTC)
+    weather.predict_weather(config, 52, 5, Recorder(), now=now)
+
+    def forbidden(*args: object) -> None:
+        raise AssertionError("Cache hit must not prepare tensors or use network")
+
+    monkeypatch.setattr("aurora_finetuning.engine.prepare_batch", forbidden)
+    monkeypatch.setattr(weather, "audit_ifs", forbidden)
+    weather.predict_weather(config, 52.1, 5.1, Recorder(), now=now)
+    assert calls == [24]

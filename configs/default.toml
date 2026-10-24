@@ -10,14 +10,16 @@ device = "mps"
 seed = 42
 max_steps = 20
 learning_rate = 0.0001
-# Fixed physical loss scales, chosen before evaluation (not fitted on test data).
-temperature_scale = 5.0
+# Fixed radar rainfall scale, chosen before evaluation.
 precipitation_scale = 1.0
 max_input_age_hours = 12
 max_memory_gb = 12.0
 # Pin the official 1.5 checkpoint and matching static asset revision.
 checkpoint_revision = "a96afd7ee6d65e3bd2d476f3be798a25a56f2296"
-training_head = "surface"
+precision = "float32"
+station_max_age_minutes = 60
+max_download_gb = 2.0
+max_storage_gb = 25.0
 # Native 1 km radar patches; train only the small radar-conditioned rain adapter.
 radar_patch_size = 192
 radar_wet_weight = 4.0

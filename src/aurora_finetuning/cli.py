@@ -42,7 +42,10 @@ def parser() -> argparse.ArgumentParser:
     weather.add_argument("--longitude", type=float)
     weather.add_argument("--hours", type=int)
     weather.add_argument("--start", type=datetime.fromisoformat)
-    weather.add_argument("--adapter", type=Path)
+    weather.add_argument(
+        "--adapter", type=Path, help="Unsupported legacy Aurora adapter"
+    )
+    weather.add_argument("--station-calibrator", type=Path)
     weather.add_argument(
         "--radar-adapter",
         type=Path,
@@ -166,19 +169,32 @@ def parser() -> argparse.ArgumentParser:
         command.add_argument(
             "--adapter",
             type=Path,
-            help="Aurora surface-head adapter used for baseline forecasts",
+            help="Unsupported legacy Aurora adapter",
         )
         if name == "train-radar":
             command.add_argument("--output", type=Path, required=True)
             command.add_argument("--steps", type=int)
         else:
             command.add_argument("--radar-adapter", type=Path, required=True)
-    training.add_argument(
-        "--stations",
-        type=Path,
-        nargs="+",
-        help="KNMI files for additional local training supervision",
-    )
+    for name in ("prepare-stations", "evaluate-stations"):
+        command = commands.add_parser(name, parents=[common])
+        command.add_argument("--cases", type=Path, required=True)
+        if name == "prepare-stations":
+            command.add_argument("--output", type=Path, required=True)
+            command.add_argument("--heldout-stations", nargs="*", default=[])
+        else:
+            command.add_argument("--station-calibrator", type=Path, required=True)
+            command.add_argument("--heldout-stations", nargs="*", default=[])
+    station = commands.add_parser("train-stations", parents=[common])
+    station.add_argument("--prepared", type=Path, required=True)
+    station.add_argument("--output", type=Path, required=True)
+    bench = commands.add_parser("benchmark", parents=[common])
+    bench.add_argument("--initialization", type=datetime.fromisoformat, required=True)
+    bench.add_argument("--source", choices=("era5", "ifs"), default="era5")
+    bench.add_argument("--output", type=Path, required=True)
+    bench.add_argument("--compare-precision", action="store_true")
+    bench.add_argument("--hours", type=int)
+    bench.add_argument("--reference", type=Path)
     evaluate = commands.add_parser("evaluate", parents=[common])
     evaluate.add_argument("--prediction", type=Path, required=True)
     evaluate.add_argument("--stations", type=Path, nargs="+")
@@ -217,6 +233,8 @@ def dispatch(args: argparse.Namespace, config: Config, recorder: Recorder) -> ob
             location.longitude,
         )
         kwargs = {"radar_adapter": args.radar_adapter} if args.radar_adapter else {}
+        if args.station_calibrator:
+            kwargs["station_calibrator"] = args.station_calibrator
         return predict_weather(
             config,
             location.latitude,
@@ -242,11 +260,16 @@ def dispatch(args: argparse.Namespace, config: Config, recorder: Recorder) -> ob
             )
             save_forecast(dataset, args.output)
         return {"radar": str(args.output)}
-    if args.command == "train-radar":
+    if args.command in ("train", "train-radar"):
         from aurora_finetuning.radar_training import train_radar
 
         return train_radar(
-            config, args.cases, args.output, recorder, args.steps, args.adapter
+            config,
+            args.cases,
+            args.output,
+            recorder,
+            args.steps,
+            getattr(args, "adapter", None),
         )
     if args.command == "evaluate-radar-adapter":
         from aurora_finetuning.radar_training import evaluate_adapter
@@ -346,54 +369,38 @@ def dispatch(args: argparse.Namespace, config: Config, recorder: Recorder) -> ob
             "parameters": sum(p.numel() for p in model.parameters()),
             "scientific_skill_verified": False,
         }
-    if args.command in ("prepare", "hindcast", "smoke"):
-        from aurora_finetuning.model import infer, load_model, save_forecast
+    if args.command == "hindcast":
+        from aurora_finetuning.engine import ForecastEngine
+        from aurora_finetuning.model import save_forecast
+
+        if args.adapter is not None:
+            raise ValueError("Legacy surface-head adapters are unsupported")
+        with ForecastEngine(config, recorder) as engine:
+            dataset = engine.predict(
+                args.initialization, args.hours or config.hours, args.source
+            )
+        dataset.attrs["adapter_sha256"] = ""
+        save_forecast(dataset, args.output)
+        return {"forecast": str(args.output), "hours": dataset.sizes["time"]}
+    if args.command in ("prepare", "smoke"):
+        from aurora_finetuning.model import infer, load_model
         from aurora_finetuning.preparation import prepare_batch
         from aurora_finetuning.regional import regional_context
 
         if args.initialization is None:
             raise ValueError("Data/model smoke requires --initialization")
+        if args.command == "smoke" and args.backward:
+            raise ValueError(
+                "Aurora is frozen; use smoke-architecture for gradient diagnostics"
+            )
         with regional_context():
             batch = prepare_batch(
                 config, args.initialization, recorder, getattr(args, "source", "era5")
             )
-            if args.command == "prepare" or (
-                args.command == "smoke" and args.kind == "data"
-            ):
+            if args.command == "prepare" or args.kind == "data":
                 return {"shape": list(batch.spatial_shape), "finite_inputs": True}
-            model = load_model(config, recorder, getattr(args, "adapter", None))
-            if args.command == "smoke" and args.backward:
-                import torch
-
-                from aurora_finetuning.training import trainable_surface_heads
-
-                trainable_surface_heads(model)
-                with recorder.measure("smoke.pretrained_forward_backward"):
-                    prediction = model.forward(batch, lead_times=torch.tensor([1.0]))
-                    loss = prediction.surf_vars["2t"].mean()
-                    if not torch.isfinite(loss):
-                        raise ValueError("Nonfinite model smoke loss")
-                    loss.backward()
-                return {
-                    "pretrained_backward_completed": True,
-                    "scientific_skill_verified": False,
-                }
-            ds = infer(
-                model,
-                batch,
-                (args.hours or config.hours) if args.command == "hindcast" else 1,
-                config,
-                recorder,
-            )
-            if args.command == "hindcast":
-                from aurora_finetuning.acquisition import sha256
-
-                ds.attrs["adapter_sha256"] = (
-                    sha256(args.adapter) if args.adapter else ""
-                )
-                with recorder.measure("forecast.write_netcdf"):
-                    save_forecast(ds, args.output)
-                return {"forecast": str(args.output), "hours": ds.sizes["time"]}
+            model = load_model(config, recorder)
+            infer(model, batch, 1, config, recorder)
             return {
                 "pretrained_forward_completed": True,
                 "scientific_skill_verified": False,
@@ -414,11 +421,45 @@ def dispatch(args: argparse.Namespace, config: Config, recorder: Recorder) -> ob
             device=args.device,
             recorder=recorder,
         )
-    if args.command == "train":
-        from aurora_finetuning.training import train
+    if args.command == "prepare-stations":
+        from aurora_finetuning.stations import prepare_examples
 
-        return train(
-            config, args.cases, args.output, recorder, args.steps, args.stations
+        return prepare_examples(
+            config, args.cases, args.output, recorder, frozenset(args.heldout_stations)
+        )
+    if args.command == "train-stations":
+        from aurora_finetuning.stations import train_station
+
+        return train_station(config, args.prepared, args.output, recorder)
+    if args.command == "evaluate-stations":
+        from aurora_finetuning.stations import evaluate_station
+
+        return evaluate_station(
+            config,
+            args.cases,
+            args.station_calibrator,
+            recorder,
+            frozenset(args.heldout_stations),
+        )
+    if args.command == "benchmark":
+        from aurora_finetuning.benchmark import benchmark, compare_reference
+
+        if args.reference is not None:
+            return compare_reference(
+                config,
+                args.initialization,
+                args.source,
+                args.reference,
+                args.output,
+                recorder,
+            )
+        return benchmark(
+            config,
+            args.initialization,
+            args.source,
+            args.output,
+            recorder,
+            args.compare_precision,
         )
     if args.command == "evaluate":
         import xarray as xr
@@ -540,6 +581,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "result": result,
                     "timings": recorder.report(),
                     "input_sha256": recorder.inputs,
+                    "network_bytes": recorder.network_bytes,
+                    "retained_bytes": recorder.retained_bytes,
                 },
             )
             logging.info("Timing report: %s", report)

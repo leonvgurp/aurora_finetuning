@@ -76,10 +76,9 @@ def read_radar_cases(path: Path) -> dict[str, list[RadarCase]]:
             raise ValueError("Duplicate radar case cutoffs")
         cases[split] = sorted(entries, key=lambda entry: entry.initialization)
     for before, after in (("train", "validation"), ("validation", "test")):
-        if (
-            cases[before][-1].initialization + timedelta(hours=30)
-            >= cases[after][0].initialization
-        ):
+        if cases[before][-1].initialization + timedelta(hours=8 + 30) >= cases[after][
+            0
+        ].initialization - timedelta(hours=2):
             raise ValueError(
                 "Radar splits require >30h separation of history/target windows"
             )
@@ -122,14 +121,14 @@ def validate_case(
         history_at(radar, case.initialization)
         wanted = [
             np.datetime64(case.initialization + timedelta(minutes=5 * i), "ns")
-            for i in range(1, 73)
+            for i in range(1, 97)
         ]
         if not all(time in radar.time.values for time in wanted):
             raise ValueError(
-                "Radar case requires six hours of subsequent measured targets"
+                "Radar case requires eight hours of subsequent measured targets"
             )
         # Check spatial and temporal baseline coverage on a small native-grid slice.
-        for minute in (5, 360):
+        for minute in (5, 480):
             values = baseline_at(
                 forecast,
                 radar.isel(y=slice(None, None, 16), x=slice(None, None, 16)),
@@ -141,51 +140,155 @@ def validate_case(
                 )
 
 
-def example(
-    case: RadarCase,
-    minutes: int,
-    config: Config,
-    origin: tuple[int, int] | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Load one bounded spatial patch; targets are never included in input features."""
+@dataclass
+class PreparedCase:
+    """One bounded patch with reusable radar history and Aurora interpolation."""
+
+    history: xr.DataArray
+    geometry: xr.Dataset
+    targets: FloatArray
+    baselines: FloatArray
+    age: float
+
+    def tensors(
+        self, minute: int, config: Config
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Construct one lead from cached observations and hourly baseline maps."""
+        baseline = self.geometry.latitude.copy(
+            data=self.baselines[minute // 5 - 1] / 12
+        )
+        features, base = feature_tensors(
+            self.history, baseline, minute, self.age, config
+        )
+        target = torch.tensor(
+            self.targets[minute // 5 - 1][None],
+            dtype=torch.float32,
+            device=config.device,
+        )
+        return features, base, target
+
+
+def prepare_case(
+    case: RadarCase, config: Config, origin: tuple[int, int] | None = None
+) -> PreparedCase:
+    """Read a patch once; map eight hourly Aurora fields onto its radar geometry."""
     with (
-        xr.open_dataset(case.radar) as dataset,
+        xr.open_dataset(case.radar) as radar,
         xr.open_dataset(case.forecast) as forecast,
     ):
         size = config.radar_patch_size
         row, col = origin or (
-            (dataset.sizes["y"] - size) // 2,
-            (dataset.sizes["x"] - size) // 2,
+            (radar.sizes["y"] - size) // 2,
+            (radar.sizes["x"] - size) // 2,
         )
-        patch = dataset.isel(y=slice(row, row + size), x=slice(col, col + size))
-        history = history_at(patch, case.initialization).load()
-        valid = case.initialization + timedelta(minutes=minutes)
-        try:
-            target = patch.precipitation_mm.sel(time=np.datetime64(valid, "ns")).load()
-        except KeyError as error:
-            raise ValueError("Missing measured radar target") from error
-        if np.isinf(target.values).any() or np.any(
-            np.isfinite(target.values) & (target.values < 0)
-        ):
-            raise ValueError("Invalid measured radar target")
-        baseline = baseline_at(forecast, patch, valid).load()
-        initialization = datetime.fromisoformat(
-            str(forecast.attrs["initialization_utc"])
+        patch = radar.isel(y=slice(row, row + size), x=slice(col, col + size)).load()
+        history = history_at(patch, case.initialization)
+        target_times = [
+            np.datetime64(case.initialization + timedelta(minutes=i), "ns")
+            for i in range(5, 481, 5)
+        ]
+        targets = np.asarray(
+            patch.precipitation_mm.sel(time=target_times).values, dtype=float
         )
-        features, base = feature_tensors(
-            history,
-            baseline,
-            minutes,
-            (case.initialization - initialization).total_seconds() / 3600,
-            config,
+        if np.isinf(targets).any() or np.any(np.isfinite(targets) & (targets < 0)):
+            raise ValueError("Invalid measured radar targets")
+        # A cutoff may fall between clock hours; compute all containing hours exactly.
+        mapping: dict[datetime, FloatArray] = {}
+        maps = []
+        for minute in range(5, 481, 5):
+            valid = case.initialization + timedelta(minutes=minute)
+            end = valid.replace(minute=0, second=0, microsecond=0)
+            if valid != end:
+                end += timedelta(hours=1)
+            if end not in mapping:
+                mapping[end] = (
+                    np.asarray(baseline_at(forecast, patch, valid).values, dtype=float)
+                    * 12
+                )
+            maps.append(mapping[end])
+        age = (
+            case.initialization
+            - datetime.fromisoformat(str(forecast.attrs["initialization_utc"]))
+        ).total_seconds() / 3600
+        return PreparedCase(history, patch, targets, np.stack(maps), age)
+
+
+def tile_origins(case: RadarCase, config: Config) -> list[tuple[int, int]]:
+    """Cover deterministic interiors without counting overlapping edge tiles twice."""
+    size = config.radar_patch_size
+    stride = size - 2 * RADIUS
+    if stride < 1:
+        raise ValueError("Radar patches must have a nonempty context interior")
+    with xr.open_dataset(case.radar) as radar:
+        axes = []
+        for name in ("y", "x"):
+            maximum = radar.sizes[name] - size
+            if maximum < 0:
+                raise ValueError("Radar dataset smaller than configured tile")
+            origins = list(range(0, maximum + 1, stride))
+            if origins[-1] != maximum:
+                origins.append(maximum)
+            axes.append(origins)
+    return [(row, col) for row in axes[0] for col in axes[1]]
+
+
+def validation_predictions(
+    model: RadarRainAdapter, records: list[PreparedCase], config: Config
+) -> tuple[FloatArray, FloatArray, FloatArray]:
+    """Gather all eight hours without opening target files during forward passes."""
+    predicted, baseline, observed = [], [], []
+    with torch.inference_mode():
+        for record in records:
+            steps = []
+            for minute in range(5, 481, 5):
+                features, base, _ = record.tensors(minute, config)
+                steps.append(
+                    model(features, base)[0, RADIUS:-RADIUS, RADIUS:-RADIUS]
+                    .cpu()
+                    .numpy()
+                )
+            shape = steps[0].shape
+            predicted.append(np.stack(steps).reshape(8, 12, *shape).sum(1))
+            baseline.append(
+                record.baselines[:, RADIUS:-RADIUS, RADIUS:-RADIUS]
+                .reshape(8, 12, *shape)
+                .sum(1)
+                / 12
+            )
+            observed.append(
+                record.targets[:, RADIUS:-RADIUS, RADIUS:-RADIUS]
+                .reshape(8, 12, *shape)
+                .sum(1)
+            )
+    return np.stack(predicted), np.stack(baseline), np.stack(observed)
+
+
+def select_weights(
+    predicted: FloatArray, baseline: FloatArray, observed: FloatArray
+) -> list[float]:
+    """Select per-hour weights on validation MAE with a CSI non-regression gate."""
+    from aurora_finetuning.rainfall_metrics import event_scores
+
+    weights = []
+    for hour in range(8):
+        base = baseline[:, hour]
+        raw = predicted[:, hour]
+        target = observed[:, hour]
+        reference = event_scores(base, target, 0.1)
+        best = (
+            float(reference["mae"]) if reference["mae"] is not None else float("inf"),
+            0.0,
         )
-        observed = torch.tensor(
-            target.values[None], dtype=torch.float32, device=config.device
-        )
-        persistence = torch.tensor(
-            history.values[-1:], dtype=torch.float32, device=config.device
-        )
-    return features, base, observed, persistence
+        for weight in (0.25, 0.5, 0.75, 1.0):
+            scores = event_scores(base + weight * (raw - base), target, 0.1)
+            csi, base_csi = scores["csi"], reference["csi"]
+            if scores["mae"] is not None and (
+                base_csi is None or (csi is not None and csi >= base_csi)
+            ):
+                candidate = (float(scores["mae"]), weight)
+                best = min(best, candidate)
+        weights.append(best[1])
+    return weights
 
 
 def train_radar(
@@ -196,107 +299,131 @@ def train_radar(
     steps: int | None = None,
     base_adapter: Path | None = None,
 ) -> dict[str, object]:
-    """Train a small rain adapter and select weights using validation observations."""
+    """Compare calendar ablations and radar-only control on validation, never test."""
+    from aurora_finetuning.artifacts import atomic_output
+
+    if base_adapter is not None:
+        raise ValueError("Legacy surface-head adapters are unsupported")
+    if output.exists():
+        raise FileExistsError(output)
     cases = read_radar_cases(manifest)
     count = config.max_steps if steps is None else steps
     if count < 1:
-        raise ValueError("Radar training steps must be positive")
-    if output.exists():
-        raise FileExistsError(output)
+        raise ValueError("Training steps must be positive")
     check_device(config)
     for case in cases["train"] + cases["validation"]:
-        validate_case(case, config, base_adapter, recorder)
-    recorder.inputs[str(manifest)] = sha256(manifest)
-    torch.manual_seed(config.seed)
-    rng = np.random.default_rng(config.seed)
-    model = RadarRainAdapter().to(config.device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate)
+        validate_case(case, config, None, recorder)
+    validation = [prepare_case(case, config) for case in cases["validation"]]
+    # Keep only one training case resident at a time.
     output.mkdir(parents=True)
-    history: list[dict[str, float | int]] = []
-    best = float("inf")
-    for step in range(count):
-        case = cases["train"][step % len(cases["train"])]
-        minutes = int(rng.integers(1, 73)) * 5
-        with xr.open_dataset(case.radar) as ds:
-            origin = (
-                int(rng.integers(0, ds.sizes["y"] - config.radar_patch_size + 1)),
-                int(rng.integers(0, ds.sizes["x"] - config.radar_patch_size + 1)),
-            )
-        model.train()
-        with recorder.measure("radar.training_step"):
-            features, baseline, target, _ = example(case, minutes, config, origin)
-            optimizer.zero_grad(set_to_none=True)
-            loss = radar_loss(model(features, baseline), target, config)
-            torch.autograd.backward(loss)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
-        model.eval()
-        with recorder.measure("radar.validation"), torch.no_grad():
-            scores = []
-            for validation in cases["validation"]:
-                for lead in (5, 30, 60, 120, 240, 360):
-                    features, baseline, target, _ = example(validation, lead, config)
-                    scores.append(
-                        float(
-                            radar_loss(model(features, baseline), target, config).cpu()
-                        )
+    candidates = []
+    for radar_only in (False, True):
+        best_variant: tuple[float, Path] | None = None
+        for seasonal in (False, True):
+            torch.manual_seed(config.seed)
+            rng = np.random.default_rng(config.seed)
+            model = RadarRainAdapter(seasonal, radar_only).to(config.device)
+            optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate)
+            best_score = float("inf")
+            selected_state: dict[str, torch.Tensor] = {}
+            history = []
+            for step in range(count):
+                case = cases["train"][step % len(cases["train"])]
+                origins = tile_origins(case, config)
+                origin = origins[int(rng.integers(len(origins)))]
+                record = prepare_case(case, config, origin)
+                minute = int(rng.integers(1, 97)) * 5
+                model.train()
+                with recorder.measure("radar.training_step"):
+                    features, baseline, target = record.tensors(minute, config)
+                    optimizer.zero_grad(set_to_none=True)
+                    loss = radar_loss(model(features, baseline), target, config)
+                    torch.autograd.backward(loss)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    optimizer.step()
+                model.eval()
+                # Validation cadence bounds repeated inference for larger pilots.
+                if (step + 1) % max(1, count // 5) == 0 or step + 1 == count:
+                    with recorder.measure("radar.validation"):
+                        p, b, o = validation_predictions(model, validation, config)
+                    score = float(np.nanmean(np.abs(p - o)))
+                    if not np.isfinite(score):
+                        raise ValueError("Nonfinite validation score")
+                    if score < best_score:
+                        best_score = score
+                        selected_state = {
+                            name: tensor.detach().cpu().clone()
+                            for name, tensor in model.state_dict().items()
+                        }
+                    history.append(
+                        {
+                            "step": step + 1,
+                            "training_loss": float(loss.detach().cpu()),
+                            "validation_mae": score,
+                        }
                     )
-        score = float(np.mean(scores))
-        if not np.isfinite(score):
-            raise ValueError("Nonfinite radar validation loss")
-        history.append(
-            {
-                "step": step + 1,
-                "training_loss": float(loss.detach().cpu()),
-                "validation_loss": score,
-            }
-        )
-        if score < best:
-            best = score
-            checkpoint = output / "best.pt"
-            torch.save(
-                {
-                    "architecture": ARCHITECTURE,
-                    "parameters": model.state_dict(),
-                    "base_revision": config.checkpoint_revision,
-                    "base_adapter_sha256": sha256(base_adapter)
-                    if base_adapter
-                    else None,
-                    "base_resolution": config.resolution,
-                    "precipitation_scale": config.precipitation_scale,
-                    "trained_steps": step + 1,
-                    "seed": config.seed,
-                },
-                checkpoint,
+                check_memory(config)
+            model.load_state_dict(selected_state)
+            model.eval()
+            p, b, o = validation_predictions(model, validation, config)
+            model.lead_weights = select_weights(p, b, o)
+            path = (
+                output / f"{'radar-only' if radar_only else 'conditioned'}"
+                f"-seasonal-{seasonal}.pt"
             )
-        check_memory(config)
-    checkpoint = output / "best.pt"
-    write_json(
-        checkpoint.with_suffix(".json"),
-        {
-            "sha256": sha256(checkpoint),
-            "architecture": ARCHITECTURE,
-            "best_validation_loss": best,
-        },
-    )
+            with atomic_output(path) as temporary:
+                torch.save(
+                    {
+                        "architecture": ARCHITECTURE,
+                        "parameters": selected_state,
+                        "base_revision": config.checkpoint_revision,
+                        "base_adapter_sha256": None,
+                        "base_resolution": config.resolution,
+                        "precipitation_scale": config.precipitation_scale,
+                        "trained_steps": count,
+                        "seed": config.seed,
+                        "seasonal": seasonal,
+                        "radar_only": radar_only,
+                        "lead_weights": model.lead_weights,
+                    },
+                    temporary,
+                )
+            write_json(
+                path.with_suffix(".json"),
+                {"sha256": sha256(path), "architecture": ARCHITECTURE},
+            )
+            candidates.append(
+                {
+                    "file": path.name,
+                    "radar_only": radar_only,
+                    "seasonal": seasonal,
+                    "validation_mae": best_score,
+                    "weights": model.lead_weights,
+                    "history": history,
+                }
+            )
+            candidate = (best_score, path)
+            if best_variant is None or candidate[0] < best_variant[0]:
+                best_variant = candidate
+        if best_variant is None:
+            raise ValueError("No valid radar model")
+        selected = output / ("radar-only.pt" if radar_only else "best.pt")
+        with atomic_output(selected) as temporary:
+            temporary.write_bytes(best_variant[1].read_bytes())
+        write_json(
+            selected.with_suffix(".json"),
+            {"sha256": sha256(selected), "architecture": ARCHITECTURE},
+        )
     report: dict[str, object] = {
-        "mode": "frozen Aurora with trainable native-grid radar rain decoder",
-        "radar_inputs": "24 measured five-minute frames at or before each cutoff",
-        "targets": "subsequent measured five-minute rainfall; no KNMI forecasts",
-        "history": history,
-        "best_validation_loss": best,
+        "mode": "frozen Aurora with external radar decoder",
+        "candidates": candidates,
+        "history": candidates[0]["history"],
         "test_evaluated": False,
-        "validation_sampling": "central patch; 5, 30, 60, 120, 240, 360 minute leads",
-        "cases": json.loads(manifest.read_text()),
         "input_sha256": recorder.inputs,
-        "config": {
-            "seed": config.seed,
-            "patch_size": config.radar_patch_size,
-            "learning_rate": config.learning_rate,
-            "wet_weight": config.radar_wet_weight,
-            "precipitation_scale": config.precipitation_scale,
-        },
         "timings": recorder.report(),
+        "validation_sampling": (
+            "central patch; all 96 leads; evaluate uses tiled test interiors"
+        ),
     }
     write_json(output / "training.json", report)
     return report
@@ -309,47 +436,146 @@ def evaluate_adapter(
     recorder: Recorder,
     base_adapter: Path | None = None,
 ) -> dict[str, object]:
-    """Score held-out central patches at all 72 steps, including hourly accumulation."""
+    """Score deterministic test tiles, all hours, raw and selected refinements."""
+    from aurora_finetuning.grid import make_grid
+    from aurora_finetuning.observations import aggregate_radar
+    from aurora_finetuning.rainfall_metrics import (
+        bootstrap_cases,
+        hourly_report,
+        motion_forecast,
+    )
+
     cases = read_radar_cases(manifest)["test"]
-    check_device(config)
     model = load_radar_adapter(adapter, config, base_adapter, recorder)
-    output: list[dict[str, object]] = []
+    radar_only_path = adapter.parent / "radar-only.pt"
+    control = (
+        load_radar_adapter(radar_only_path, config, None, recorder)
+        if radar_only_path.exists()
+        else None
+    )
+    output = []
+    case_errors: dict[str, list[list[float]]] = {}
     for case in cases:
         validate_case(case, config, base_adapter, recorder)
-        predictions: list[FloatArray] = []
-        observations: list[FloatArray] = []
-        baselines: list[FloatArray] = []
-        persistence: list[FloatArray] = []
-        for lead in range(5, 361, 5):
-            with recorder.measure("radar.test_step"), torch.inference_mode():
-                features, base, target, persist = example(case, lead, config)
-                predicted = model(features, base)
-            for records, values in (
-                (predictions, predicted),
-                (observations, target),
-                (baselines, base),
-                (persistence, persist),
-            ):
-                records.append(values[0, RADIUS:-RADIUS, RADIUS:-RADIUS].cpu().numpy())
-        measured = (
-            np.stack(observations).reshape(6, 12, *observations[0].shape).sum(axis=1)
-        )
-        row: dict[str, object] = {"cutoff": case.initialization.isoformat()}
-        for name, records in (
-            ("radar_conditioned", predictions),
-            ("aurora", baselines),
-            ("radar_persistence", persistence),
-        ):
-            hourly = np.stack(records).reshape(6, 12, *records[0].shape).sum(axis=1)
-            row[name] = {
-                "hourly": metrics(hourly, measured),
-                "six_hour_total": metrics(hourly.sum(axis=0), measured.sum(axis=0)),
+        tiles = []
+        with xr.open_dataset(case.radar) as source:
+            height, width = source.sizes["y"], source.sizes["x"]
+        arrays = {
+            name: np.full((8, height, width), np.nan)
+            for name in (
+                "raw_adapter",
+                "radar_conditioned",
+                "aurora",
+                "radar_persistence",
+                "radar_motion",
+                "radar_only",
+            )
+        }
+        observations = np.full((8, height, width), np.nan)
+        for origin in tile_origins(case, config):
+            record = prepare_case(case, config, origin)
+            with recorder.measure("radar.test_tile"):
+                predicted, baseline, observed = validation_predictions(
+                    model, [record], config
+                )
+                only = (
+                    validation_predictions(control, [record], config)[0][0]
+                    if control
+                    else None
+                )
+            p, b, o = predicted[0], baseline[0], observed[0]
+            history = np.asarray(record.history.values, dtype=float)
+            persistence = np.broadcast_to(
+                history[-1, RADIUS:-RADIUS, RADIUS:-RADIUS] * 12, p.shape
+            )
+            motion = (
+                np.stack(
+                    [
+                        motion_forecast(history, minute)[RADIUS:-RADIUS, RADIUS:-RADIUS]
+                        for minute in range(5, 481, 5)
+                    ]
+                )
+                .reshape(8, 12, *p.shape[1:])
+                .sum(1)
+            )
+            row, col = origin
+            selection = (
+                slice(None),
+                slice(row + RADIUS, row + config.radar_patch_size - RADIUS),
+                slice(col + RADIUS, col + config.radar_patch_size - RADIUS),
+            )
+            candidates = {
+                "raw_adapter": p,
+                "radar_conditioned": b
+                + np.array(model.lead_weights)[:, None, None] * (p - b),
+                "aurora": b,
+                "radar_persistence": persistence,
+                "radar_motion": motion,
             }
-        output.append(row)
+            if only is not None:
+                candidates["radar_only"] = only
+            for name, values in candidates.items():
+                arrays[name][selection] = values
+            observations[selection] = o
+            tiles.append(list(origin))
+        if control is None:
+            del arrays["radar_only"]
+        # Every method is scored on exactly the same observed/forecastable cells.
+        mask = np.isfinite(observations)
+        for name, values in arrays.items():
+            if name != "radar_motion":
+                mask &= np.isfinite(values)
+        measured = np.where(mask, observations, np.nan)
+        row_report: dict[str, object] = {
+            "cutoff": case.initialization.isoformat(),
+            "tiles": tiles,
+        }
+        with xr.open_dataset(case.radar) as geometry:
+            lat = np.asarray(geometry.latitude.values, dtype=float)
+            lon = np.asarray(geometry.longitude.values, dtype=float)
+        grid = make_grid(config)
+        coarse_o = np.stack(
+            [aggregate_radar(v, lat, lon, grid, config.resolution) for v in measured]
+        )
+        for name, values in arrays.items():
+            values = np.where(mask, values, np.nan)
+            report = hourly_report(values, measured)
+            if name == "radar_motion":
+                support = np.isfinite(values) & np.isfinite(measured)
+                report["aurora_on_motion_support"] = hourly_report(
+                    np.where(support, arrays["aurora"], np.nan),
+                    np.where(support, measured, np.nan),
+                )
+                report["support_note"] = (
+                    "Motion has limited spatial support; "
+                    "paired Aurora uses identical support"
+                )
+            coarse_p = np.stack(
+                [aggregate_radar(v, lat, lon, grid, config.resolution) for v in values]
+            )
+            report["aurora_grid"] = {
+                "by_lead_hour": [metrics(coarse_p[i], coarse_o[i]) for i in range(8)],
+                "eight_hour_total": metrics(coarse_p.sum(0), coarse_o.sum(0)),
+            }
+            row_report[name] = report
+            case_errors.setdefault(name, []).append(
+                [
+                    float(np.nanmean(np.abs(values[i] - measured[i])))
+                    if mask[i].any()
+                    else float("nan")
+                    for i in range(8)
+                ]
+            )
+        output.append(row_report)
         check_memory(config)
     return {
         "test": output,
-        "spatial_sampling": "central native-grid patch interior only",
-        "input_sha256": recorder.inputs,
+        "spatial_sampling": "deterministic tiled interiors; shared finite masks",
+        "uncertainty": {
+            name: bootstrap_cases(np.asarray(values), config.seed)
+            for name, values in case_errors.items()
+        },
+        "mode": "retrospective; historical publication latency not reconstructed",
         "scientific_skill_verified": False,
+        "input_sha256": recorder.inputs,
     }

@@ -1,0 +1,23 @@
+{
+  "train": [{
+    "issuance": "2023-01-04T06:00:00+00:00",
+    "forecast": "../outputs/station-train.nc",
+    "observations": ["../data/prepared/station-history-train.nc"],
+    "targets": ["../data/prepared/station-targets-train.nc"],
+    "history_forecasts": []
+  }],
+  "validation": [{
+    "issuance": "2024-01-04T06:00:00+00:00",
+    "forecast": "../outputs/station-validation.nc",
+    "observations": ["../data/prepared/station-history-validation.nc"],
+    "targets": ["../data/prepared/station-targets-validation.nc"],
+    "history_forecasts": []
+  }],
+  "test": [{
+    "issuance": "2025-01-04T06:00:00+00:00",
+    "forecast": "../outputs/station-test.nc",
+    "observations": ["../data/prepared/station-history-test.nc"],
+    "targets": ["../data/prepared/station-targets-test.nc"],
+    "history_forecasts": []
+  }]
+}

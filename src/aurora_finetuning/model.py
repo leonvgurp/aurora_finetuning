@@ -13,7 +13,7 @@ from aurora import AuroraV1p5, Batch, rollout
 
 from aurora_finetuning.assets import CHECKPOINT, verify_assets
 from aurora_finetuning.config import Config
-from aurora_finetuning.grid import FloatArray, make_grid
+from aurora_finetuning.grid import FloatArray
 from aurora_finetuning.telemetry import Recorder, peak_rss_gb
 
 LOGGER = logging.getLogger(__name__)
@@ -73,39 +73,24 @@ def check_memory(config: Config) -> None:
 def load_model(
     config: Config, recorder: Recorder, adapter: Path | None = None
 ) -> AuroraV1p5:
-    """Load verified local weights and optional trained surface heads."""
+    """Load verified frozen Aurora weights; reject legacy surface-head adapters."""
+    if adapter is not None:
+        raise ValueError(
+            "Legacy surface-head adapters are unsupported; train external models"
+        )
     check_device(config)
     torch.manual_seed(config.seed)
     np.random.seed(config.seed)
     with recorder.measure("model.verify_assets"):
         verify_assets(config)
     with recorder.measure("model.load"):
-        model = AuroraV1p5(autocast=False, use_fp16_safe_attention=False)
+        model = AuroraV1p5(
+            autocast=config.precision == "float16" and config.device != "mps",
+            use_fp16_safe_attention=config.precision == "float16",
+        )
         model.load_checkpoint_local(str(config.root / "checkpoints/base" / CHECKPOINT))
-        if adapter is not None:
-            state = torch.load(adapter, map_location="cpu", weights_only=True)
-            if (
-                state["base_revision"]
-                != json.loads(
-                    (config.root / "checkpoints/base/assets.json").read_text()
-                )["revision"]
-            ):
-                raise ValueError("Adapter base checkpoint revision mismatch")
-            if state["resolution"] != config.resolution:
-                raise ValueError("Adapter grid resolution mismatch")
-            if state["grid"] != make_grid(config).describe():
-                raise ValueError("Adapter regional domain mismatch")
-            expected = {
-                n
-                for n, _ in model.named_parameters()
-                if n.startswith(
-                    ("decoder.surf_heads.2t.", "decoder.surf_heads.scaled_tp_1h.")
-                )
-            }
-            if set(state["parameters"]) != expected:
-                raise ValueError("Adapter parameter set differs from surface heads")
-            model.load_state_dict(state["parameters"], strict=False)
         model.eval()
+        model.requires_grad_(False)
     check_memory(config)
     recorder.accelerator_memory = lambda: accelerator_memory(config.device)
     with recorder.measure("model.device_transfer"):
@@ -119,7 +104,7 @@ def load_model(
 def infer(
     model: AuroraV1p5, batch: Batch, hours: int, config: Config, recorder: Recorder
 ) -> xr.Dataset:
-    """Run hourly substeps and keep only temperature and precipitation on CPU."""
+    """Run hourly substeps and retain requested physical surface fields on CPU."""
     if not 1 <= hours <= 48:
         raise ValueError("Internal rollout horizon must be between 1 and 48 hours")
     fields: list[xr.Dataset] = []
@@ -134,7 +119,13 @@ def infer(
     with torch.inference_mode():
         for hour in range(1, hours + 1):
             with recorder.measure(f"inference.hour_{hour}"):
-                prediction = next(generator)
+                # Upstream chooses CPU autocast on MPS; select the actual device.
+                with torch.autocast(
+                    device_type=config.device,
+                    dtype=torch.float16,
+                    enabled=config.precision == "float16",
+                ):
+                    prediction = next(generator)
                 temp = prediction.surf_vars["2t"][0, 0].detach().cpu().numpy() - 273.15
                 # Upstream returns log-untransformed water depth in metres.
                 precip = np.asarray(
@@ -162,6 +153,21 @@ def infer(
                                 ("time", "latitude", "longitude"),
                                 temp[None],
                             ),
+                            **{
+                                name: (
+                                    ("time", "latitude", "longitude"),
+                                    prediction.surf_vars[key][0, 0]
+                                    .detach()
+                                    .cpu()
+                                    .numpy()[None]
+                                    / scale,
+                                )
+                                for name, key, scale in (
+                                    ("pressure_hpa", "msl", 100),
+                                    ("wind_u_ms", "10u", 1),
+                                    ("wind_v_ms", "10v", 1),
+                                )
+                            },
                             "precipitation_mm": (
                                 ("time", "latitude", "longitude"),
                                 np.maximum(precip, 0)[None],
@@ -191,6 +197,15 @@ def infer(
         raw_minimum_precipitation_mm=minimum_raw,
         precipitation_postprocessing="zero floor; nonfinite values fail",
     )
+    for name, unit in (
+        ("pressure_hpa", "hPa"),
+        ("wind_u_ms", "m/s"),
+        ("wind_v_ms", "m/s"),
+    ):
+        if not np.isfinite(result[name]).all():
+            raise ValueError(f"Nonfinite forecast {name}")
+        result[name].attrs["units"] = unit
+    result.attrs["precision"] = config.precision
     result.temperature_c.attrs["units"] = "degC"
     result.precipitation_mm.attrs["units"] = "mm"
     return result
@@ -201,7 +216,10 @@ def save_forecast(dataset: xr.Dataset, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists():
         raise FileExistsError(path)
-    dataset.to_netcdf(path, mode="w")
+    from aurora_finetuning.artifacts import atomic_output
+
+    with atomic_output(path) as temporary:
+        dataset.to_netcdf(temporary, mode="w")
 
 
 def initialization_of(dataset: xr.Dataset) -> datetime:

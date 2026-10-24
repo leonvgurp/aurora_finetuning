@@ -14,7 +14,6 @@ from aurora_finetuning.grid import make_grid
 from aurora_finetuning.model import accelerator_memory, synchronize
 from aurora_finetuning.regional import regional_context
 from aurora_finetuning.telemetry import Recorder
-from aurora_finetuning.training import trainable_surface_heads
 
 
 def preflight(config: Config, recorder: Recorder) -> dict[str, object]:
@@ -145,7 +144,14 @@ def architecture_smoke(device: str, recorder: Recorder) -> dict[str, object]:
             )
             model.to(device)
             model.eval()
-            trainable_surface_heads(model)
+            model.requires_grad_(False)
+            parameters = [
+                p
+                for n, p in model.named_parameters()
+                if n.startswith("decoder.surf_heads.2t.")
+            ]
+            for parameter in parameters:
+                parameter.requires_grad_(True)
             batch = synthetic_batch()
         recorder.synchronize = lambda: synchronize(device)
         recorder.accelerator_memory = lambda: accelerator_memory(device)

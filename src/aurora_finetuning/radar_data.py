@@ -1,5 +1,6 @@
 """Measured five-minute radar data on its native projected one-kilometre grid."""
 
+import hashlib
 import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -14,7 +15,7 @@ from aurora_finetuning.config import Config
 from aurora_finetuning.credentials import knmi_api_key
 from aurora_finetuning.grid import FloatArray
 from aurora_finetuning.radar import decode_frame, text_attribute
-from aurora_finetuning.telemetry import Recorder
+from aurora_finetuning.telemetry import Recorder, write_json
 
 HISTORY_FRAMES = 24
 RADAR_DATASET = "nl_rdr_data_rtcor_5m"
@@ -224,8 +225,8 @@ def history_at(dataset: xr.Dataset, cutoff: datetime) -> xr.DataArray:
 def measured_targets(dataset: xr.Dataset, cutoff: datetime, lead: int) -> xr.DataArray:
     """Sum twelve subsequent measured five-minute amounts for a forecast lead hour."""
     validate_native(dataset)
-    if not 1 <= lead <= 6:
-        raise ValueError("Radar training supports leads 1–6 hours")
+    if not 1 <= lead <= 8:
+        raise ValueError("Radar training supports leads 1–8 hours")
     times = [
         np.datetime64(cutoff + timedelta(minutes=60 * (lead - 1) + 5 * i), "ns")
         for i in range(1, 13)
@@ -287,9 +288,42 @@ def live_history(
         recorder,
         HISTORY_FRAMES,
     )
-    with recorder.measure("radar.prepare_native_history"):
-        dataset = native_radar(
-            paths, recorder, latitude=latitude, longitude=longitude, size=128
-        )
+    identity = {
+        "latitude": latitude,
+        "longitude": longitude,
+        "size": 128,
+        "source": [
+            sha256(Path(__file__)),
+            sha256(Path(__file__).with_name("radar.py")),
+        ],
+        "inputs": [
+            json.loads(path.with_name(path.name + ".json").read_text())["sha256"]
+            for path in paths
+        ],
+    }
+    key = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
+    cached = config.root / "data/cache/radar" / f"{key}.nc"
+    manifest = cached.with_suffix(".json")
+    if cached.exists() or manifest.exists():
+        if (
+            not cached.exists()
+            or not manifest.exists()
+            or sha256(cached) != json.loads(manifest.read_text())["sha256"]
+        ):
+            raise ValueError("Incomplete or modified prepared radar cache")
+        with (
+            recorder.measure("radar.cached_native_history"),
+            xr.open_dataset(cached) as source,
+        ):
+            dataset = source.load()
+    else:
+        from aurora_finetuning.model import save_forecast
+
+        with recorder.measure("radar.prepare_native_history"):
+            dataset = native_radar(
+                paths, recorder, latitude=latitude, longitude=longitude, size=128
+            )
+            save_forecast(dataset, cached)
+            write_json(manifest, {"sha256": sha256(cached), "identity": identity})
     history_at(dataset, cutoff)
     return dataset

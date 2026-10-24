@@ -2,7 +2,7 @@
 
 import hashlib
 import json
-from datetime import date, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Protocol
@@ -90,16 +90,42 @@ def http_session() -> requests.Session:
     return session
 
 
-def download_file(session: requests.Session, url: str, path: Path) -> None:
+def download_file(
+    session: requests.Session,
+    url: str,
+    path: Path,
+    config: Config | None = None,
+    recorder: Recorder | None = None,
+) -> None:
     """Stream an unauthenticated temporary download URL to an atomic cache file."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    partial = path.with_suffix(path.suffix + ".partial")
+    from aurora_finetuning.artifacts import atomic_output
+
     with session.get(url, stream=True, timeout=(10, 120)) as response:
         response.raise_for_status()
-        with partial.open("wb") as handle:
-            for chunk in response.iter_content(1024 * 1024):
-                handle.write(chunk)
-    partial.replace(path)
+        if config is not None and recorder is not None:
+            from aurora_finetuning.resources import check_budget, retained_size
+
+            check_budget(
+                config, recorder, int(response.headers.get("Content-Length", 0))
+            )
+            existing_bytes = retained_size(config)
+        transferred = 0
+        with atomic_output(path) as temporary:
+            with temporary.open("wb") as handle:
+                for chunk in response.iter_content(1024 * 1024):
+                    transferred += len(chunk)
+                    if config is not None and recorder is not None:
+                        if (
+                            existing_bytes + transferred
+                            > config.max_storage_gb * 1024**3
+                        ):
+                            raise ValueError("Download exceeded max_storage_gb")
+                        recorder.network_bytes += len(chunk)
+                        if recorder.network_bytes > config.max_download_gb * 1024**3:
+                            raise ValueError("Download exceeded max_download_gb")
+                    handle.write(chunk)
+        if recorder is not None:
+            recorder.retained_bytes += transferred
 
 
 def normalize_cds_file(path: Path, recorder: Recorder) -> None:
@@ -297,7 +323,11 @@ def knmi_files(
                         link = api.get(f"{base}/{name}/url", timeout=(10, 60))
                         link.raise_for_status()
                         download_file(
-                            downloads, link.json()["temporaryDownloadUrl"], path
+                            downloads,
+                            link.json()["temporaryDownloadUrl"],
+                            path,
+                            config,
+                            recorder,
                         )
                         write_json(
                             manifest,
@@ -305,6 +335,7 @@ def knmi_files(
                                 "dataset": dataset,
                                 "version": version,
                                 "filename": name,
+                                "acquired_utc": datetime.now(UTC).isoformat(),
                                 "sha256": sha256(path),
                             },
                         )

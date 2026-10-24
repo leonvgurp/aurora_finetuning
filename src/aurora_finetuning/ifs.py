@@ -122,6 +122,26 @@ def audit_ifs(initialization: datetime, recorder: Recorder) -> dict[str, object]
             }
             reports.append(
                 {
+                    "estimated_bytes": {
+                        kind: sum(
+                            int(r.get("_length", 0))
+                            for r in records
+                            if (
+                                (
+                                    kind == "single"
+                                    and r.get("levtype") in ("sfc", "sol")
+                                    and r.get("param") in IFS_SURFACE
+                                )
+                                or (
+                                    kind == "pressure"
+                                    and r.get("levtype") == "pl"
+                                    and (str(r.get("param")), str(r.get("levelist")))
+                                    in required_pairs
+                                )
+                            )
+                        )
+                        for kind in ("single", "pressure")
+                    },
                     "cycle": time.isoformat(),
                     "missing_surface": missing_surface,
                     "missing_pressure_fields": sorted(required_pairs - available_pairs),
@@ -132,7 +152,10 @@ def audit_ifs(initialization: datetime, recorder: Recorder) -> dict[str, object]
     return {
         "cycles": reports,
         "compatible": all(r["compatible"] for r in reports),
-        "note": "Availability only; units and physical equivalence need validation",
+        "note": (
+            "Global GRIB payload estimate; retained regional data is smaller. "
+            "Availability does not establish physical equivalence."
+        ),
     }
 
 
@@ -228,12 +251,34 @@ def pull_ifs(
                     "levelist": [1],
                 }
                 grib_paths.append(path.with_suffix(".soil.grib2"))
+            from aurora_finetuning.resources import check_budget
+
+            estimates: dict[str, int] = (
+                next(
+                    (
+                        c.get("estimated_bytes", {})
+                        for c in cycles
+                        if c["cycle"] == time.isoformat()
+                    ),
+                    {},
+                )
+                if isinstance(cycles, list)
+                else {}
+            )
+            estimate = int(estimates.get(kind, 0))
+            if estimate <= 0:
+                raise ValueError(
+                    "IFS index lacks field lengths; cannot enforce acquisition budget"
+                )
+            check_budget(config, recorder, estimate)
             with recorder.measure(f"download.ifs.{time.isoformat()}.{kind}"):
                 if client is None:
                     client = Client(source="ecmwf", model="ifs", resol="0p25")
                 client.retrieve(request, target=str(grib))
                 if soil_request is not None:
                     client.retrieve(soil_request, target=str(grib_paths[1]))
+            transferred = sum(file.stat().st_size for file in grib_paths)
+            recorder.network_bytes += transferred
             with recorder.measure("prepare.ifs.grib"):
                 chunks: list[xr.Dataset] = []
                 datasets = [
@@ -282,7 +327,10 @@ def pull_ifs(
                     source="ECMWF IFS step-zero cycles", experimental="true"
                 )
                 validate_ifs_units(merged, kind)
-                merged.to_netcdf(path)
+                from aurora_finetuning.model import save_forecast
+
+                save_forecast(merged, path)
+                recorder.retained_bytes += path.stat().st_size
                 write_json(
                     manifest,
                     {

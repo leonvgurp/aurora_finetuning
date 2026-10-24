@@ -1,137 +1,240 @@
-# Local weather experiments with Aurora
+# Local weather prediction with Aurora and KNMI
 
-I read about Microsoft's Aurora model, knew public weather data was available,
-and wanted to find out whether I could run weather predictions locally on my Mac
-and how well they would work. This is a first draft of that experiment: use a
-globally pretrained model on a region surrounding the Netherlands, compare its
-predictions with KNMI observations, and try limited local fine-tuning.
+This project explores whether a personal computer can produce useful local weather
+forecasts using Microsoft's **Aurora 1.5**, recent KNMI weather-station observations,
+and rainfall radar. The goal is an eight-hour forecast for any locality in the
+European Netherlands, computed on the local machine.
 
-The project provides historical experiments and a **one-command live forecast**
-with hourly temperature and precipitation amounts. Inference runs locally;
-useful forecast skill and operational reliability remain open questions.
+Aurora supplies the pretrained atmospheric dynamics. Separate, lightweight models
+can adjust its temperature, pressure, and wind predictions using recent station
+measurements and refine rainfall using radar. Date, time, and location provide
+seasonal and daily context. Training happens separately from everyday prediction;
+Aurora's weights stay frozen.
+
+**Current status:** local M3/MPS forecasting and the training/evaluation workflows
+run successfully. Observation-based improvements remain experimental: the small
+station pilot improved pressure but worsened temperature and wind, and trained
+radar refinement still needs representative held-out evaluation. External models
+are enabled explicitly; the default forecast uses Aurora alone.
+
+## How it works and what data is used
+
+```text
+Fresh atmospheric initialization → local Aurora → eight-hour regional forecast
+                                                      ↓
+Recent KNMI station history + date/time/location → atmospheric adjustments
+Recent measured radar + Aurora rainfall          → detailed rainfall refinement
+                                                      ↓
+                                Hourly forecast for the requested locality
+```
+
+| Data | Purpose | Acquisition and reuse |
+|---|---|---|
+| Pinned Aurora 1.5 weights and matching static fields | Pretrained model and land-surface context | Download once from Microsoft on Hugging Face; reuse from `checkpoints/base/` |
+| ECMWF IFS step-zero fields | Fresh surface and upper-air initialization at two times six hours apart | Download required fields for new cycles; cache under `data/raw/ifs/` |
+| ERA5 sea ice | Supplement an input missing from the public IFS product | Download through CDS when needed; enforce a seven-day maximum age |
+| KNMI operational stations | Recent temperature, mean-sea-level pressure, and wind for local adjustments | Up to 72 hours of context; reuse nationwide hourly files plus recent 10-minute observations |
+| KNMI measured RTCOR radar | Rainfall location, intensity, and evolution | Two hours of five-minute frames for live refinement; reuse raw and prepared caches |
+| ERA5/CDS, optional ARCO pressure fields, and historical KNMI observations | Historical forecasts, training, and verification | Explicit historical acquisition; validated station observations are targets, not assumed live-available inputs |
+
+Stations and radar cannot replace Aurora's three-dimensional atmospheric inputs.
+The application downloads current-state initialization rather than another
+provider's future forecast. Internet access is needed to refresh observations and
+inputs; the forecasting and adjustment models execute locally.
+
+Aurora retains its 0.25° grid, approximately 17 × 28 km around the Netherlands.
+Radar refinement produces rainfall on a 1 km grid; that grid spacing does not
+establish 1 km forecast accuracy. Temperature, pressure, and broad wind patterns
+remain coarse forecasts with optional local corrections.
+
+Public IFS fields are downloaded globally before regional cropping, so small local
+files do not imply equally small transfers. ARCO is explicitly labelled as a
+regridded ERA5 mirror. Hourly operational station files arrive overnight; the live
+station window can contain intraday gaps, which remain explicit.
 
 ## Install
 
-Requires [Pixi](https://pixi.sh) and Git. Tested on Apple Silicon, 16 GB memory,
-~25 GB free disk. Pixi supplies Python 3.12 and the editable package;
-platforms: macOS ARM64 / Linux x86-64.
+Install [Pixi](https://pixi.sh) and Git first. The tested machine is an Apple M3
+MacBook Pro with 16 GB unified memory; allow approximately 25 GB free disk for
+setup and initial experiments. Supported environment platforms are macOS ARM64
+and Linux x86-64. Pixi supplies Python 3.12, dependencies, and the editable package.
 
 ```sh
+git clone https://github.com/leonvgurp/aurora_finetuning.git
+cd aurora_finetuning
 pixi install --locked
-pixi run check             # Formatting, lint, types and offline tests
-pixi run smoke             # Imports, configuration and credential presence
+pixi run check
+pixi run smoke
 ```
 
-Run from this checkout. Default device: `mps`; use `--device cpu` elsewhere.
+For an existing checkout, start with `pixi install --locked`. Run the examples
+below from the repository root. MPS is the default device; use `--device cpu`
+explicitly on other machines. There is no silent CPU fallback.
 
-- **CDS:** get a [token](https://cds.climate.copernicus.eu/how-to-api), save the
-  following in `~/.cdsapirc` (mode `600`), and accept the dataset terms for
-  [ERA5 single levels](https://cds.climate.copernicus.eu/datasets/reanalysis-era5-single-levels?tab=download)
-  and [pressure levels](https://cds.climate.copernicus.eu/datasets/reanalysis-era5-pressure-levels?tab=download).
-- **KNMI:** [request an Open Data key](https://developer.dataplatform.knmi.nl/register).
-  Set `KNMI_API_KEY` or save only the key in `.secrets/knmi-api-key` (file `600`,
-  directory `700`, no symlink). Environment overrides file; `.env` is not loaded.
-  Needed for stations/radar.
+## Configure credentials and runtime settings
+
+**CDS:** obtain a [personal token](https://cds.climate.copernicus.eu/how-to-api)
+and accept the terms for [ERA5 single levels](https://cds.climate.copernicus.eu/datasets/reanalysis-era5-single-levels)
+and [pressure levels](https://cds.climate.copernicus.eu/datasets/reanalysis-era5-pressure-levels).
+Create `~/.cdsapirc` containing:
 
 ```text
 url: https://cds.climate.copernicus.eu/api
 key: <CDS-PERSONAL-ACCESS-TOKEN>
 ```
 
-## Resources
+Then restrict access:
 
-Weights/data are downloaded on demand and Git-ignored; verified caches are reused.
+```sh
+chmod 600 ~/.cdsapirc
+```
 
-| Resource | Use and storage |
-|---|---|
-| Pinned Aurora weights + static fields | Local inference; `checkpoints/base/` (~5 GB weights) |
-| Public IFS / CDS ERA5 | Live / historical atmospheric inputs; `data/raw/ifs/`, `data/raw/era5/` |
-| ERA5 sea ice | Missing IFS field supplement; `data/raw/sea-ice/`; needs CDS |
-| KNMI stations / measured RTCOR radar | Evaluation/training; `data/raw/knmi/`, `data/prepared/radar/` |
-| PDOK locality lookup | Place names to coordinates; `data/cache/locations/` |
-| Generated results | Forecasts/adapters/metrics in `outputs/`; configuration, hashes and timings in `outputs/timings/` |
+**KNMI:** obtain an [Open Data API key](https://developer.dataplatform.knmi.nl/register).
+Set `KNMI_API_KEY`, or create `.secrets/knmi-api-key` containing only the key:
 
-Use fresh output paths. Keep secrets private and respect
-[Aurora's license](https://github.com/microsoft/aurora) and source-data terms.
+```sh
+mkdir -p .secrets
+chmod 700 .secrets
+# Save the key in .secrets/knmi-api-key using your editor, then:
+chmod 600 .secrets/knmi-api-key
+```
 
-## Workflow
+The environment variable takes precedence. Secret files must not be symlinks;
+`.env` files are not loaded. KNMI credentials are needed for radar/station access.
+CDS credentials are needed for ERA5 and sea-ice setup. Neither belongs in Git or TOML.
 
-**Predict:** configure CDS, then run setup once; repeat it when sea ice expires.
+Edit [configs/default.toml](configs/default.toml) for the region, horizon, device,
+observation freshness, and resource limits. CLI arguments override TOML values.
+Configuration and case-manifest paths resolve relative to their containing file;
+CLI paths resolve against the working directory.
+
+## Make a forecast
+
+Run setup once, and repeat it when the sea-ice supplement expires:
 
 ```sh
 pixi run weather-setup
 pixi run weather Leusden --hours 8
-# Coordinates instead: --latitude 52.09 --longitude 5.12
 ```
 
-Stdout is an hourly table: Amsterdam time with UTC offset, °C and rainfall
-**mm over the preceding hour**. Logs go to stderr. Default: 8 hours; range: 1–24.
-Optional `--start` requires a future timestamp with timezone.
-
-**Historical/head training:** populate [cases.example.json](configs/cases.example.json).
-Retrieve ERA5 from initialization −6h through +6h per case, then prepare,
-hindcast and evaluate. `train --stations FILES` optionally adds KNMI supervision.
-Compare base/adapted hindcasts on held-out dates.
-
-**Radar training:** populate [radar-cases.example.json](configs/radar-cases.example.json)
-with baseline Aurora forecasts and 24 past + 72 subsequent five-minute RTCOR
-frames per case. Preserve
-`RAD_NL25_RAC_RT_YYYYMMDDhhmm.h5` names; get measurements from
-[KNMI](https://dataplatform.knmi.nl/dataset/nl-rdr-data-rtcor-5m-1-0) or its
-[archive](https://dataplatform.knmi.nl/dataset/nl-rdr-data-rtcor-5m-tar-1-0)
-(manual extraction). KNMI forecasts/climatological corrections are rejected.
+Setup downloads the pinned model assets and validates live atmospheric inputs;
+it does not train correction models. Verified inputs and forecasts are reused.
+An alternative to locality lookup is explicit coordinates:
 
 ```sh
-pixi run prepare-radar-native --frames path/to/case/*.h5 --latitude 52.1 --longitude 5.4 --size 256 --output data/prepared/radar/train.nc
-pixi run train-radar --cases configs/radar-cases.example.json --steps 1 --output outputs/radar-pilot
-pixi run evaluate-radar-adapter --cases configs/radar-cases.example.json --radar-adapter outputs/radar-pilot/best.pt
-pixi run weather Leusden --hours 8 --radar-adapter outputs/radar-pilot/best.pt
+pixi run weather --latitude 52.09 --longitude 5.12 --hours 8
 ```
 
-Example paths need real data; one step is a smoke test. Keep radar
-`best.pt` and `best.json` together. If baselines used Aurora head weights, pass
-the same `--adapter PATH` throughout. **A representative real-storm radar
-checkpoint is not yet available.**
+Locality names use a cached PDOK lookup. Stdout contains an hourly table with:
 
-## Commands: order of events
+- Temperature in °C, mean-sea-level pressure in hPa, and 10 m wind speed in m/s.
+- Rainfall in mm over the preceding clock hour.
+- Europe/Amsterdam timestamps with UTC offsets, including daylight-saving changes.
 
-| Command | Sequence |
+Diagnostics go to stderr. Requested horizons are 1–24 hours; eight hours is the
+training/evaluation target for external models. The elapsed part of the first
+clock hour may use measured radar rainfall and is identified in the result metadata.
+
+After training and evaluating compatible external models, enable either or both:
+
+```sh
+pixi run weather Leusden --hours 8 \
+  --station-calibrator outputs/stations/model.json \
+  --radar-adapter outputs/radar/best.pt
+```
+
+These paths must contain actual trained artifacts; the example files are not
+bundled pretrained corrections. Forecasting never retrains them. Missing fresh
+nearby stations cause a per-variable Aurora fallback; corrupt artifacts,
+incompatible schemas, and unavailable required radar inputs produce explicit errors.
+
+## Train and validate local adjustments
+
+Historical data collection and training are separate operations. Start with small
+cases and cached locally generated Aurora forecasts. The case templates contain
+placeholder paths: supply the data before running the following commands. Keep
+training, validation, and test windows separate and include varied weather/seasons.
+
+### Stations
+
+Populate [station-cases.example.json](configs/station-cases.example.json) with
+issuance times, Aurora forecasts, past KNMI files, future target files, and prior
+forecast archives. Historical residuals use forecasts available by the observation
+time. Reserve entire station identifiers to test transfer between stations.
+
+```sh
+pixi run prepare-stations --cases configs/station-cases.example.json \
+  --heldout-stations 0-20000-0-06260 --output data/prepared/stations
+pixi run train-stations --prepared data/prepared/stations \
+  --output outputs/stations/model.json
+pixi run evaluate-stations --cases configs/station-cases.example.json \
+  --station-calibrator outputs/stations/model.json \
+  --heldout-stations 0-20000-0-06260
+```
+
+Ridge regression models use forecast values, lead time, cyclic date/time features,
+location, recent trends, and residual summaries. Up to four suitable stations within
+100 km supply local context. Regularization, seasonal features, and per-hour
+correction weights are selected on validation data, not test observations.
+
+### Rainfall radar
+
+Populate [radar-cases.example.json](configs/radar-cases.example.json) with baseline
+Aurora forecasts and prepared measured radar. Each case needs **24 past + 96 future
+five-minute frames**. Preserve `RAD_NL25_RAC_RT_YYYYMMDDhhmm.h5` filenames. Historical
+RTCOR archive extraction remains a manual prerequisite.
+
+```sh
+pixi run prepare-radar-native --frames /absolute/path/RAD_NL25_RAC_RT_*.h5 \
+  --latitude 52.09 --longitude 5.12 --output data/prepared/radar/case.nc
+pixi run train --cases configs/radar-cases.example.json --output outputs/radar
+pixi run evaluate-radar-adapter --cases configs/radar-cases.example.json \
+  --radar-adapter outputs/radar/best.pt
+```
+
+`train` now trains the external radar model; `train-radar` remains an alias.
+The default 20 steps are a pipeline pilot. Training compares seasonal ablations
+and a radar-only control. Verification compares Aurora, learned refinement,
+persistence, and motion extrapolation for every hour 1–8, cumulative rainfall,
+wet events, and spatial skill. Old surface-head and six-hour radar adapters are
+incompatible. Use fresh output paths; valuable results are not silently overwritten.
+
+## Performance, outputs, and checks
+
+A measured eight-hour historical run on M3/MPS with cached inputs took **38.9 s
+with a cold engine**, **2.12 s with reused weights**, and **0.055 s for a cached
+location query**. These are different execution modes, not end-to-end timings
+including fresh downloads. Separate CLI processes reload weights on cache misses;
+Python callers can reuse `ForecastEngine` in one session. Float32 remains the
+default because the tested MPS float16 path was slower.
+
+```sh
+pixi run benchmark --initialization 2024-01-01T06:00:00 \
+  --output outputs/benchmark-new
+pixi run check
+pixi run test-integration
+```
+
+The benchmark requires existing historical inputs and weights; it does not fetch
+missing data. `check` runs formatting checks, Ruff, mypy, and offline pytest tests.
+Integration checks are opt-in. `pixi run format` applies formatting. CI installs
+the locked Pixi environment and runs the same quality checks.
+
+| Artifact | Format and location |
 |---|---|
-| `weather-setup` | Verify/download weights → select IFS pair → obtain/reuse sea ice → download/validate inputs |
-| `weather` | Resolve locality → select/validate inputs → reuse/run regional forecast → extract location → optionally apply radar adapter → print table |
-| `download-model`, `pull-era5`, `pull-knmi` | Cache requested assets/data; no model run |
-| `prepare` → `hindcast` → `evaluate` | Align/check inputs → run Aurora/write NetCDF → score observations and baselines |
-| `train` | Freeze backbone → fit temperature/rain heads → select validation-best weights |
-| `prepare-radar-native` → `train-radar` | Validate/project/crop measurements → train rain adapter using past radar and later measured targets |
-| `evaluate-radar-adapter` | Score held-out cases against Aurora and radar persistence |
-| `forecast`, `history` | Location forecast as JSON, or summaries of downloaded station observations |
+| Raw and prepared observations/inputs | NetCDF, GRIB, or HDF5 under `data/` |
+| Regional Aurora forecasts | NetCDF under `outputs/weather/` |
+| Trained station/radar models | JSON coefficients / PyTorch checkpoint at the requested output path |
+| Results, metrics, input hashes, configuration, and timing reports | JSON under the requested directory and `outputs/timings/` |
 
-Arguments: `pixi run COMMAND --help`. Other helpers: `providers`, `smoke-*`,
-`pull-ifs`, `pull-sea-ice`, `pull-arco-pressure` (ERA5 mirror), `prepare-radar`
-(coarse-grid scoring). Research commands require explicit inputs.
+Raw Aurora values remain available alongside corrected location results. Forecast
+caches are independent of observation refreshes. `max_download_gb` and
+`max_storage_gb` bound KNMI/IFS acquisition in GiB; model setup and explicit
+CDS/ARCO operations have separate acquisition characteristics. No data is
+automatically deleted. The 12 GiB process-RSS guard is not a total unified-memory cap.
+Generated data, weights, environments, outputs, and secrets are Git-ignored.
 
-## Technical details
-
-- **Config:** [configs/default.toml](configs/default.toml); CLI > TOML > defaults.
-  Config/manifest paths resolve relative to their file; CLI paths to the working
-  directory. Forecast NetCDF contains `temperature_c` and `precipitation_mm`.
-- **Aurora:** experimental global-model crop around NL, 0.25° spacing (~17 × 28 km
-  locally), aligned 48 × 64 grid; two input states six hours apart, static fields
-  and 13 pressure levels. Temperature is interpolated; base rain uses nearest cell.
-- **Freshness:** IFS ≤12h old; sea ice ≤7 days old for both inputs (setup requests
-  five days earlier); latest radar ≤20 minutes old. Missing/stale inputs fail.
-  Live checks need internet access.
-- **Radar:** frozen Aurora + trainable rain adapter; native 1 km history/masks →
-  five-minute amounts → hourly sums. Elapsed first-hour rain is measured; beyond
-  six hours from the radar cutoff, rows retain Aurora rain.
-- **Training:** seed 42, 20 pilot steps, validation-selected weights, >30h split
-  gaps, masked labels, wet-weighted log-rain loss. Radar scores sample central
-  patches; historical publication latency is not reconstructed.
-- **Limits:** local MPS inference and radar forward/backward work; useful rainfall
-  skill remains unproven. One historical case did not beat persistence/dry
-  baselines. Grid spacing does not establish accuracy; the 12 GB RSS guard is not
-  a total GPU-memory limit.
-
-Development: `pixi run format` applies Ruff formatting; `pixi run check` runs
-non-mutating checks; `pixi run test-integration` runs the separate tiny Aurora
-forward/backward test. CI uses the locked Pixi environment and the same checks.
+See [design and measured evidence](docs/design.md) for source references, data
+schemas, evaluation details, pilot results, and limitations. Local execution is
+demonstrated; reliable skill across Dutch localities and eight-hour radar
+improvements remain questions for broader held-out and prospective evaluation.

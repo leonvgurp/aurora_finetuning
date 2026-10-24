@@ -35,6 +35,8 @@ class Timing:
 class Recorder:
     """Collect stage timings and persist an exclusive JSON report."""
 
+    network_bytes: int = 0
+    retained_bytes: int = 0
     timings: list[Timing] = field(default_factory=list)
     inputs: dict[str, str] = field(default_factory=dict)
     synchronize: Callable[[], None] = field(default=lambda: None, repr=False)
@@ -79,6 +81,9 @@ class Recorder:
 def write_json(path: Path, value: object) -> None:
     """Create a JSON artifact without overwriting existing results."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("x", encoding="utf-8") as handle:
-        json.dump(value, handle, indent=2, allow_nan=False)
-        handle.write("\n")
+    from aurora_finetuning.artifacts import atomic_output
+
+    with atomic_output(path) as temporary:
+        with temporary.open("w", encoding="utf-8") as handle:
+            json.dump(value, handle, indent=2, allow_nan=False)
+            handle.write("\n")

@@ -10,13 +10,13 @@ import requests
 import xarray as xr
 
 from aurora_finetuning.acquisition import sha256
-from aurora_finetuning.assets import download_assets, verify_assets
+from aurora_finetuning.assets import download_assets
 from aurora_finetuning.config import Config
+from aurora_finetuning.engine import ForecastEngine
 from aurora_finetuning.forecast import query_grid, validate_location
 from aurora_finetuning.grid import make_grid
 from aurora_finetuning.ifs import audit_ifs, pull_ifs, pull_sea_ice, sea_ice_supplement
-from aurora_finetuning.model import infer, load_model, save_forecast
-from aurora_finetuning.preparation import prepare_batch
+from aurora_finetuning.model import save_forecast
 from aurora_finetuning.regional import regional_context
 from aurora_finetuning.telemetry import Recorder, write_json
 
@@ -86,6 +86,58 @@ def find_sea_ice(config: Config, cycle: datetime, recorder: Recorder) -> Path:
     )
 
 
+def pipeline_identity() -> str:
+    """Invalidate numerical caches when forecast or regional implementation changes."""
+    from importlib.metadata import distribution
+
+    upstream = distribution("microsoft-aurora")
+    dependency_identity = upstream.version + (
+        upstream.read_text("direct_url.json") or ""
+    )
+    directory = Path(__file__).parent
+    return hashlib.sha256(
+        (
+            dependency_identity
+            + "".join(
+                sha256(directory / name)
+                for name in (
+                    "model.py",
+                    "engine.py",
+                    "regional.py",
+                    "preparation.py",
+                    "grid.py",
+                    "ifs.py",
+                )
+            )
+        ).encode()
+    ).hexdigest()
+
+
+def cached_grid(
+    config: Config, cycle: datetime, horizon: int, recorder: Recorder
+) -> xr.Dataset | None:
+    """Validate a cached forecast before constructing tensors or touching weights."""
+    try:
+        key = cache_identity(config, cycle, None)
+    except FileNotFoundError:
+        return None
+    directory = config.root / "outputs/weather" / key
+    for path in sorted(directory.glob("*.nc")):
+        if int(path.stem) < horizon:
+            continue
+        manifest = path.with_suffix(".json")
+        if not manifest.exists():
+            raise ValueError(f"Incomplete forecast cache: {path}")
+        expected = json.loads(manifest.read_text())["sha256"]
+        if sha256(path) != expected:
+            raise ValueError(f"Modified forecast cache: {path}")
+        with recorder.measure("forecast.read_cache"), xr.open_dataset(path) as source:
+            result = source.load()
+        recorder.inputs[str(path)] = expected
+        return result
+    return None
+
+
 def cache_identity(config: Config, cycle: datetime, adapter: Path | None) -> str:
     """Identify model, region, numerical settings and immutable input manifests."""
     manifests = [
@@ -94,7 +146,10 @@ def cache_identity(config: Config, cycle: datetime, adapter: Path | None) -> str
         for kind in ("single", "pressure")
     ]
     identity = {
-        "version": 1,
+        "version": 2,
+        "output_schema": 2,
+        "code": pipeline_identity(),
+        "precision": config.precision,
         "initialization": cycle.isoformat(),
         "model": {
             "revision": config.checkpoint_revision,
@@ -119,9 +174,15 @@ def predict_weather(
     now: datetime | None = None,
     adapter: Path | None = None,
     radar_adapter: Path | None = None,
+    station_calibrator: Path | None = None,
+    engine: ForecastEngine | None = None,
 ) -> dict[str, object]:
     """Retrieve fresh inputs, reuse or generate a regional forecast, then query it."""
     validate_location(latitude, longitude)
+    if adapter is not None:
+        raise ValueError(
+            "Legacy surface-head adapters are unsupported; use external calibrators"
+        )
     now = now or datetime.now(UTC)
     start = start or now
     if start.tzinfo is None or now.tzinfo is None:
@@ -132,46 +193,51 @@ def predict_weather(
         )
     if start.astimezone(UTC) - now.astimezone(UTC) > timedelta(hours=47):
         raise ValueError("Requested window exceeds the 48-hour internal rollout limit")
-    cycle = select_cycle(config, now, recorder)
-    first = start.astimezone(UTC).replace(minute=0, second=0, microsecond=0)
-    first += timedelta(hours=1)
-    horizon = int(
-        (
-            (first + timedelta(hours=config.hours - 1)).replace(tzinfo=None) - cycle
-        ).total_seconds()
-        / 3600
-    )
-    if not 1 <= horizon <= 48:
-        raise ValueError("Requested window exceeds the 48-hour internal rollout limit")
-    verify_assets(config)
-    ice = find_sea_ice(config, cycle, recorder)
-    pull_ifs(config, cycle, recorder, ice)
-    # Preparing even on a forecast cache hit verifies checksums, units and fields.
-    with regional_context():
-        batch = prepare_batch(config, cycle, recorder, "ifs")
-        key = cache_identity(config, cycle, adapter)
-        directory = config.root / "outputs/weather" / key
-        dataset: xr.Dataset | None = None
-        for path in sorted(directory.glob("*.nc")):
-            if int(path.stem) < horizon:
-                continue
-            expected = json.loads(path.with_suffix(".json").read_text())["sha256"]
-            actual = sha256(path)
-            if actual != expected:
-                raise ValueError(f"Modified forecast cache: {path}")
-            with xr.open_dataset(path) as cached:
-                dataset = cached.load()
-            recorder.inputs[str(path)] = actual
+    first = start.astimezone(UTC).replace(
+        minute=0, second=0, microsecond=0
+    ) + timedelta(hours=1)
+    end = (first + timedelta(hours=config.hours - 1)).replace(tzinfo=None)
+    dataset = None
+    cycle = None
+    for candidate in recent_cycles(now, config.max_input_age_hours):
+        horizon = int((end - candidate).total_seconds() / 3600)
+        if not 1 <= horizon <= 48:
+            continue
+        dataset = cached_grid(config, candidate, horizon, recorder)
+        if dataset is not None:
+            cycle = candidate
             break
+    if dataset is None:
+        cycle = select_cycle(config, now, recorder)
+        horizon = int((end - cycle).total_seconds() / 3600)
+        if not 1 <= horizon <= 48:
+            raise ValueError(
+                "Requested window exceeds the 48-hour internal rollout limit"
+            )
+        ice = find_sea_ice(config, cycle, recorder)
+        pull_ifs(config, cycle, recorder, ice)
+        dataset = cached_grid(config, cycle, horizon, recorder)
         if dataset is None:
-            model = load_model(config, recorder, adapter)
-            dataset = infer(model, batch, horizon, config, recorder)
-            # Validate the whole requested table before publishing a cache artifact.
+            if engine is None:
+                with ForecastEngine(config, recorder) as session:
+                    dataset = session.predict(cycle, horizon, "ifs")
+            else:
+                if engine.config != config:
+                    raise ValueError("Forecast engine configuration mismatch")
+                dataset = engine.predict(cycle, horizon, "ifs")
             query_grid(dataset, latitude, longitude, config.hours, start)
-            path = directory / f"{horizon:02d}.nc"
+            key = cache_identity(config, cycle, None)
+            path = config.root / "outputs/weather" / key / f"{horizon:02d}.nc"
+            dataset.attrs["available_utc"] = datetime.now(UTC).isoformat()
             save_forecast(dataset, path)
             write_json(path.with_suffix(".json"), {"sha256": sha256(path), "key": key})
+    if cycle is None:
+        raise ValueError("Missing forecast initialization")
     result = query_grid(dataset, latitude, longitude, config.hours, start)
+    if station_calibrator is not None:
+        from aurora_finetuning.station_data import apply_live_stations
+
+        result = apply_live_stations(result, station_calibrator, config, recorder, now)
     if radar_adapter is not None:
         from aurora_finetuning.radar_model import apply_live_radar
 
@@ -213,6 +279,8 @@ def setup_weather(
         pull_sea_ice(config, day, recorder)
         ice = find_sea_ice(config, cycle, recorder)
     pull_ifs(config, cycle, recorder, ice)
+    from aurora_finetuning.preparation import prepare_batch
+
     with regional_context():
         prepare_batch(config, cycle, recorder, "ifs")
     return {

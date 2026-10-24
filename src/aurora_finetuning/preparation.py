@@ -13,7 +13,7 @@ from aurora import Batch, Metadata
 from aurora.insolation import insolation
 
 from aurora_finetuning.acquisition import ATMOSPHERE, LEVELS, SURFACE, sha256
-from aurora_finetuning.assets import STATIC, verify_assets
+from aurora_finetuning.assets import STATIC
 from aurora_finetuning.config import Config
 from aurora_finetuning.grid import Grid, make_grid
 from aurora_finetuning.telemetry import Recorder
@@ -134,7 +134,13 @@ def require_units(array: xr.DataArray, allowed: set[str]) -> None:
 def static_fields(config: Config) -> dict[str, torch.Tensor]:
     """Read only verified Microsoft static assets and select the regional cells."""
     grid = make_grid(config)
-    verify_assets(config)
+    manifest = json.loads((config.root / "checkpoints/base/assets.json").read_text())
+    if (
+        manifest["revision"] != config.checkpoint_revision
+        or sha256(config.root / "checkpoints/base" / STATIC)
+        != manifest["sha256"][STATIC]
+    ):
+        raise ValueError("Missing or modified static asset/revision")
     # Only load the verified official pickle: it is executable content.
     with (config.root / "checkpoints/base" / STATIC).open("rb") as handle:
         raw = pickle.load(handle)

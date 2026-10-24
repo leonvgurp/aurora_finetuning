@@ -8,9 +8,7 @@ import numpy as np
 import xarray as xr
 
 from aurora_finetuning.config import load_config
-from aurora_finetuning.model import infer, initialization_of, load_model
-from aurora_finetuning.preparation import prepare_batch
-from aurora_finetuning.regional import regional_context
+from aurora_finetuning.model import initialization_of
 from aurora_finetuning.telemetry import Recorder
 
 
@@ -50,6 +48,11 @@ def query_grid(
     rain = selected.precipitation_mm.sel(
         latitude=latitude, longitude=longitude, method="nearest"
     ).values
+    extra = {
+        name: selected[name].interp(latitude=latitude, longitude=longitude).values
+        for name in ("pressure_hpa", "wind_u_ms", "wind_v_ms")
+        if name in selected
+    }
     rows: list[dict[str, object]] = []
     for i, time in enumerate(times):
         if not np.isfinite(temp[i]) or not np.isfinite(rain[i]):
@@ -65,6 +68,18 @@ def query_grid(
                 "precipitation_mm": round(float(rain[i]), 3),
             }
         )
+    for i, row in enumerate(rows):
+        for name, values in extra.items():
+            if not np.isfinite(values[i]):
+                raise ValueError(f"Missing predictions for {name}")
+            row[name] = float(values[i])
+        if "wind_u_ms" in extra and "wind_v_ms" in extra:
+            row["wind_speed_ms"] = float(
+                np.hypot(extra["wind_u_ms"][i], extra["wind_v_ms"][i])
+            )
+        for name in ("temperature_c", "precipitation_mm", *extra):
+            row[f"aurora_{name}"] = row[name]
+            row[f"{name}_source"] = "Aurora"
     return {
         "latitude": latitude,
         "longitude": longitude,
@@ -96,6 +111,8 @@ def forecast(
     initialization and start; it never relabels historical data as today's weather.
     """
     validate_location(latitude, longitude)
+    if adapter is not None:
+        raise ValueError("Legacy surface-head adapters are unsupported")
     if not 1 <= hours <= 24:
         raise ValueError("hours must be between 1 and 24")
     config = load_config(Path(config_path) if config_path is not None else None)
@@ -134,10 +151,10 @@ def forecast(
                 "Query start must be within max_input_age_hours of initialization"
             )
         horizon = int(np.ceil(age)) + hours
-        with regional_context():
-            batch = prepare_batch(config, initialization, recorder, source)
-            model = load_model(config, recorder, adapter)
-            dataset = infer(model, batch, horizon, config, recorder)
+        from aurora_finetuning.engine import ForecastEngine
+
+        with ForecastEngine(config, recorder) as engine:
+            dataset = engine.predict(initialization, horizon, source)
     with recorder.measure("forecast.extract_location"):
         result = query_grid(dataset, latitude, longitude, hours, start)
     result["timings"] = recorder.report()
