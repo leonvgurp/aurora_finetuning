@@ -104,3 +104,36 @@ Full local machine artifacts are under `outputs/leusden-development-20261024/`, 
 ## Verification
 
 Locked Pixi checks: formatting, Ruff, mypy and 93 offline tests passed. One opt-in integration test was excluded; real MPS full-window replays were run separately. Initial sandbox MPS and unsupported decoder-argument attempts failed, were corrected, and are not counted as successful forecasts.
+
+## Doubled-domain follow-up
+
+The [wide profile](../../configs/leusden-wide.toml) doubles both dimensions of the previously tested 64×96 grid. Grid alignment yields **128×192 cells**, **35.75–67.5°N, −18.5–29.25°E**, at unchanged 0.25° spacing. This is four times the cell count, with the forecast window still eight hours.
+
+The real-data one-hour gate and full forecast passed on the M3/16 GB Mac in float32. Peak process RSS: **5.178 GiB**; peak sampled MPS driver allocation: **6.461 GiB**. These figures overlap and must not be added to estimate unified-memory use. The 12 GiB process guard is unchanged.
+
+The gate, including cold model loading, took **26.661 s**. The subsequent complete 15-hour rollout on the warm engine took **23.540 s**, providing the same eight queried hours as the original experiment. The total includes an extra one-hour feasibility prediction, so it is not directly comparable with a cold forecast without that gate.
+
+A separate synthetic one-step hardware benchmark preceded the real-data test. Its resized fields were not valid weather inputs; its predictions were discarded and never compared with Buienradar.
+
+| Grid | Temperature MAE vs reference °C | Hourly rainfall MAE mm | Eight-hour rainfall mm |
+|---|---:|---:|---:|
+| 48×64 original | 1.573 | 0.929 | 0.228 |
+| 64×96 larger | 1.108 | 0.949 | 0.025 |
+| 128×192 wide | 1.179 | 0.949 | 0.033 |
+
+| Hour ending | Wide temperature °C | Reference °C | Wide rainfall mm | Reference mm |
+|---|---:|---:|---:|---:|
+| 16:00 | 9.54 | 12.00 | 0.004 | 0.000 |
+| 17:00 | 9.46 | 11.00 | 0.005 | 0.000 |
+| 18:00 | 9.78 | 11.00 | 0.005 | 0.000 |
+| 19:00 | 10.17 | 10.00 | 0.004 | 1.200 |
+| 20:00 | 10.45 | 10.00 | 0.003 | 1.500 |
+| 21:00 | 10.28 | 9.00 | 0.003 | 0.500 |
+| 22:00 | 10.18 | 9.00 | 0.004 | 1.400 |
+| 23:00 | 10.13 | 9.00 | 0.005 | 3.000 |
+
+The wider sea-ice supplement retained **30,871 bytes**; CDS took **1169.4 seconds** including queue/processing. Atmospheric transfer remained **zero bytes** by recropping cached global GRIB. This one-off setup delay is separate from inference latency.
+
+All raw artifacts, the one-hour gate, input hashes, system memory snapshots and full predictions are saved beneath `outputs/leusden-development-20261024/wide/`. Cross-domain metrics are in `outputs/leusden-development-20261024/wide-comparison.json`. The explicit profile is feasible on the tested machine; one reference case cannot establish regional forecasting skill, and the daily default remains unchanged.
+
+Configuration loading, patch alignment, formatting and Git whitespace checks passed. No Python implementation changed in this follow-up; the previous 93-test result remains the last offline suite run.
