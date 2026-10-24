@@ -45,7 +45,7 @@ operations and physical outputs. `weather.py` handles live orchestration and
 caching; `forecast.py` queries gridded predictions. Acquisition/preparation modules
 retain provider-specific validation. Station and radar modules separate data,
 features/models, training and evaluation. CLI parsing and configuration remain at
-the boundary. There is no service, generic plugin layer or notebook implementation.
+the boundary. The results notebook is an analysis client; implementation remains in Python modules.
 
 A session reuses one frozen Aurora instance. A forecast cache hit avoids weights,
 atmospheric tensor preparation and network cycle discovery. Cache identities
