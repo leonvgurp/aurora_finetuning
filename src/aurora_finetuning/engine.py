@@ -1,5 +1,6 @@
 """Explicit session lifetime for reusable, frozen regional Aurora inference."""
 
+from collections.abc import Sequence
 from datetime import datetime
 from types import TracebackType
 
@@ -34,7 +35,14 @@ class ForecastEngine:
     ) -> None:
         self.close()
 
-    def predict(self, initialization: datetime, hours: int, source: str) -> xr.Dataset:
+    def predict(
+        self,
+        initialization: datetime,
+        hours: int,
+        source: str,
+        *,
+        requested_leads: Sequence[int] | None = None,
+    ) -> xr.Dataset:
         """Forecast from explicit current-state inputs, never external future fields."""
         if self._closed:
             raise ValueError("Forecast engine is closed")
@@ -43,6 +51,15 @@ class ForecastEngine:
             if self._model is None:
                 self._model = load_model(self.config, self.recorder)
                 self._model.requires_grad_(False)
+            if requested_leads is not None:
+                return infer(
+                    self._model,
+                    batch,
+                    hours,
+                    self.config,
+                    self.recorder,
+                    requested_leads,
+                )
             return infer(self._model, batch, hours, self.config, self.recorder)
 
     def close(self) -> None:

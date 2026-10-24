@@ -26,6 +26,7 @@ class Config:
     max_memory_gb: float = 12.0
     checkpoint_revision: str = "a96afd7ee6d65e3bd2d476f3be798a25a56f2296"
     precision: str = "float32"
+    sparse_forecasts: bool = False
     station_max_age_minutes: int = 60
     max_download_gb: float = 2.0
     max_storage_gb: float = 25.0
@@ -75,6 +76,8 @@ class Config:
             <= 0
         ):
             raise ValueError("Learning rate, scales and memory limit must be positive")
+        if not isinstance(self.sparse_forecasts, bool):
+            raise ValueError("sparse_forecasts must be boolean")
         if self.precision not in ("float32", "float16"):
             raise ValueError("precision must be float32 or float16")
         if not 10 <= self.station_max_age_minutes <= 180:

@@ -17,6 +17,8 @@ max_memory_gb = 12.0
 # Pin the official 1.5 checkpoint and matching static asset revision.
 checkpoint_revision = "a96afd7ee6d65e3bd2d476f3be798a25a56f2296"
 precision = "float32"
+# Sparse substeps passed float32 equivalence checks; historical callers stay dense.
+sparse_forecasts = true
 station_max_age_minutes = 60
 max_download_gb = 2.0
 max_storage_gb = 25.0

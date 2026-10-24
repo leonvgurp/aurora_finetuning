@@ -3,6 +3,7 @@
 import json
 import logging
 import math
+from collections.abc import Sequence
 from datetime import datetime
 from pathlib import Path
 
@@ -102,7 +103,12 @@ def load_model(
 
 
 def infer(
-    model: AuroraV1p5, batch: Batch, hours: int, config: Config, recorder: Recorder
+    model: AuroraV1p5,
+    batch: Batch,
+    hours: int,
+    config: Config,
+    recorder: Recorder,
+    requested_leads: Sequence[int] | None = None,
 ) -> xr.Dataset:
     """Run hourly substeps and retain requested physical surface fields on CPU."""
     if not 1 <= hours <= 48:
@@ -110,14 +116,30 @@ def infer(
     fields: list[xr.Dataset] = []
     negative_count = 0
     minimum_raw = 0.0
-    generator = rollout(
-        model,
-        batch,
-        steps=math.ceil(hours / 6),
-        fine_lead_times=[1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+    from aurora_finetuning.leads import lead_schedule, scheduled_rollout
+
+    requested = (
+        list(range(1, hours + 1)) if requested_leads is None else list(requested_leads)
     )
+    schedule = (
+        list(range(1, hours + 1))
+        if requested_leads is None
+        else lead_schedule(hours, requested)
+    )
+    if requested_leads is None:
+        generator = rollout(
+            model,
+            batch,
+            steps=math.ceil(hours / 6),
+            fine_lead_times=[1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+        )
+    else:
+        generator = (
+            prediction
+            for _, prediction in scheduled_rollout(model, batch, hours, requested)
+        )
     with torch.inference_mode():
-        for hour in range(1, hours + 1):
+        for hour in schedule:
             with recorder.measure(f"inference.hour_{hour}"):
                 # Upstream chooses CPU autocast on MPS; select the actual device.
                 with torch.autocast(
@@ -126,6 +148,9 @@ def infer(
                     enabled=config.precision == "float16",
                 ):
                     prediction = next(generator)
+                if hour not in requested:
+                    check_memory(config)
+                    continue
                 temp = prediction.surf_vars["2t"][0, 0].detach().cpu().numpy() - 273.15
                 # Upstream returns log-untransformed water depth in metres.
                 precip = np.asarray(
@@ -188,6 +213,8 @@ def infer(
         source="Aurora 1.5 regional experiment",
         resolution=config.resolution,
         precipitation_interval="(valid_time - 1 hour, valid_time]",
+        requested_lead_hours=json.dumps(sorted(requested)),
+        executed_lead_hours=json.dumps(schedule),
         experimental="true",
         seed=config.seed,
         checkpoint_revision=config.checkpoint_revision,
