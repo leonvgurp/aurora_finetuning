@@ -16,7 +16,11 @@ dependencies = [
     "torch>=2.11.0,<3",
     "huggingface-hub>=2.2.0,<3",
     "ecmwf-opendata>=0.3.35,<0.4",
-    "cfgrib>=0.9.15.1,<0.10", "zarr>=3.4.1,<4", "gcsfs>=2026.10.1,<2027",
+    "cfgrib>=0.9.15.1,<0.10",
+    "zarr>=3.4.1,<4",
+    "gcsfs>=2026.10.1,<2027",
+    "pysteps>=1.18,<2",
+    "opencv-python-headless>=4.10,<5",
 ]
 
 [project.scripts]
@@ -49,6 +53,8 @@ ruff = ">=0.14,<1"
 mypy = ">=1.18,<2"
 pytest = ">=8,<10"
 types-requests = ">=2.33.0.20261006,<3"
+c-compiler = ">=2.0.0,<3"
+llvm-openmp = ">=23.1.4,<24"
 
 [tool.pixi.environments]
 default = { features = ["dev"], solve-group = "default" }
@@ -59,6 +65,9 @@ weather-setup = "aurora-finetuning weather-setup --config configs/default.toml"
 prepare-radar-native = "aurora-finetuning prepare-radar-native --config configs/default.toml"
 train-radar = "aurora-finetuning train-radar --config configs/default.toml"
 evaluate-radar-adapter = "aurora-finetuning evaluate-radar-adapter --config configs/default.toml"
+calibrate-rain = "aurora-finetuning calibrate-rain --config configs/default.toml"
+evaluate-rain = "aurora-finetuning evaluate-rain --config configs/default.toml"
+adapter-feasibility = "aurora-finetuning adapter-feasibility --config configs/default.toml"
 format = "ruff format ."
 format-check = "ruff format --check ."
 lint = "ruff check ."
@@ -104,7 +113,7 @@ strict = true
 # These provider/model libraries ship no typing marker. Keep the exception at
 # the dependency boundary; all project code remains under strict checking.
 [[tool.mypy.overrides]]
-module = ["aurora.*", "cdsapi", "h5py", "cfgrib", "ecmwf.*"]
+module = ["aurora.*", "cdsapi", "h5py", "cfgrib", "ecmwf.*", "pysteps.*", "cv2.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

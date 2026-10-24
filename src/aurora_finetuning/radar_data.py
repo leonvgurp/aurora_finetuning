@@ -17,6 +17,11 @@ from aurora_finetuning.grid import FloatArray
 from aurora_finetuning.radar import decode_frame, text_attribute
 from aurora_finetuning.telemetry import Recorder, write_json
 
+
+class RadarUnavailable(ValueError):
+    """Expected missing or stale observations; callers may retain Aurora."""
+
+
 HISTORY_FRAMES = 24
 RADAR_DATASET = "nl_rdr_data_rtcor_5m"
 
@@ -116,27 +121,31 @@ def native_radar(
     *,
     latitude: float,
     longitude: float,
-    size: int,
+    size: int | None,
 ) -> xr.Dataset:
-    """Prepare a bounded native-grid patch without spatial averaging or upsampling."""
-    if not paths or len(paths) > 128 or not 128 <= size <= 256:
+    """Prepare a native-grid patch, or the full measured domain when size is None."""
+    if not paths or len(paths) > 128 or (size is not None and not 128 <= size <= 256):
         raise ValueError("Supply 1–128 observed frames and a 128–256 pixel patch")
     geometry = radar_geometry(paths[0])
-    distance = (geometry.latitude - latitude) ** 2 + (
-        (geometry.longitude - longitude) * np.cos(np.deg2rad(latitude))
-    ) ** 2
-    row, col = np.unravel_index(int(np.argmin(distance.values)), distance.shape)
-    if (
-        row < size // 2
-        or col < size // 2
-        or row + (size + 1) // 2 > geometry.sizes["y"]
-        or col + (size + 1) // 2 > geometry.sizes["x"]
-    ):
-        raise ValueError("Radar patch extends beyond the native image")
-    selection = {
-        "y": slice(row - size // 2, row - size // 2 + size),
-        "x": slice(col - size // 2, col - size // 2 + size),
-    }
+    selection: dict[str, slice]
+    if size is None:
+        selection = {"y": slice(None), "x": slice(None)}
+    else:
+        distance = (geometry.latitude - latitude) ** 2 + (
+            (geometry.longitude - longitude) * np.cos(np.deg2rad(latitude))
+        ) ** 2
+        row, col = np.unravel_index(int(np.argmin(distance.values)), distance.shape)
+        if (
+            row < size // 2
+            or col < size // 2
+            or row + (size + 1) // 2 > geometry.sizes["y"]
+            or col + (size + 1) // 2 > geometry.sizes["x"]
+        ):
+            raise ValueError("Radar patch extends beyond the native image")
+        selection = {
+            "y": slice(row - size // 2, row - size // 2 + size),
+            "x": slice(col - size // 2, col - size // 2 + size),
+        }
     cropped = geometry.isel(selection)
     records: list[tuple[datetime, FloatArray]] = []
     for path in paths:
@@ -150,7 +159,10 @@ def native_radar(
         if not geometry.identical(other):
             raise ValueError("Radar frames have different projections or native grids")
         decoded_time, values = decode_frame(path)
-        if decoded_time != time or values.shape != distance.shape:
+        if decoded_time != time or values.shape != (
+            geometry.sizes["y"],
+            geometry.sizes["x"],
+        ):
             raise ValueError("Radar image and geolocation do not agree")
         records.append((time, values[selection["y"], selection["x"]]))
         recorder.inputs[str(path)] = sha256(path)
@@ -217,7 +229,7 @@ def history_at(dataset: xr.Dataset, cutoff: datetime) -> xr.DataArray:
         result: xr.DataArray = dataset["precipitation_mm"].sel(time=times)
         return result
     except KeyError as error:
-        raise ValueError(
+        raise RadarUnavailable(
             "Missing measured radar history before the forecast cutoff"
         ) from error
 
@@ -246,6 +258,8 @@ def live_history(
     longitude: float,
     recorder: Recorder,
     now: datetime,
+    *,
+    full_domain: bool = False,
 ) -> xr.Dataset:
     """Fetch measured past frames through the secret-safe KNMI downloader."""
     base = f"https://api.dataplatform.knmi.nl/open-data/v1/datasets/{RADAR_DATASET}/versions/1.0/files"
@@ -263,7 +277,7 @@ def live_history(
             response.raise_for_status()
         files = response.json()["files"]
     if not files:
-        raise ValueError("No measured KNMI radar files are available")
+        raise RadarUnavailable("No measured KNMI radar files are available")
     name = files[0]["filename"]
     prefix = "RAD_NL25_RAC_RT_"
     if (
@@ -275,7 +289,7 @@ def live_history(
     cutoff = datetime.strptime(name[len(prefix) : -3], "%Y%m%d%H%M")
     age = (now.astimezone(UTC).replace(tzinfo=None) - cutoff).total_seconds() / 60
     if not 0 <= age <= config.radar_max_age_minutes:
-        raise ValueError(
+        raise RadarUnavailable(
             "Measured radar is future-dated or exceeds radar_max_age_minutes"
         )
     start = cutoff - timedelta(minutes=5 * (HISTORY_FRAMES - 1))
@@ -288,10 +302,16 @@ def live_history(
         recorder,
         HISTORY_FRAMES,
     )
+    expected = [
+        f"{prefix}{start + timedelta(minutes=5 * i):%Y%m%d%H%M}.h5"
+        for i in range(HISTORY_FRAMES)
+    ]
+    if sorted(path.name for path in paths) != expected:
+        raise RadarUnavailable("Missing frames in the two-hour measured radar history")
     identity = {
-        "latitude": latitude,
-        "longitude": longitude,
-        "size": 128,
+        "latitude": None if full_domain else latitude,
+        "longitude": None if full_domain else longitude,
+        "size": None if full_domain else 128,
         "source": [
             sha256(Path(__file__)),
             sha256(Path(__file__).with_name("radar.py")),
@@ -321,7 +341,11 @@ def live_history(
 
         with recorder.measure("radar.prepare_native_history"):
             dataset = native_radar(
-                paths, recorder, latitude=latitude, longitude=longitude, size=128
+                paths,
+                recorder,
+                latitude=latitude,
+                longitude=longitude,
+                size=None if full_domain else 128,
             )
             save_forecast(dataset, cached)
             write_json(manifest, {"sha256": sha256(cached), "identity": identity})

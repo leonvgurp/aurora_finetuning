@@ -3,6 +3,7 @@
 import json
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from itertools import pairwise
 from pathlib import Path
 
 import numpy as np
@@ -74,6 +75,13 @@ def read_radar_cases(path: Path) -> dict[str, list[RadarCase]]:
         if len({entry.initialization for entry in entries}) != len(entries):
             raise ValueError("Duplicate radar case cutoffs")
         cases[split] = sorted(entries, key=lambda entry: entry.initialization)
+        for previous, following in pairwise(cases[split]):
+            if following.initialization - previous.initialization <= timedelta(
+                hours=40
+            ):
+                raise ValueError(
+                    "Radar cases require >30h separation of complete windows"
+                )
     for before, after in (("train", "validation"), ("validation", "test")):
         if cases[before][-1].initialization + timedelta(hours=8 + 30) >= cases[after][
             0
