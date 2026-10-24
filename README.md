@@ -9,7 +9,9 @@ Aurora supplies the pretrained atmospheric dynamics. Separate, lightweight model
 can adjust its temperature, pressure, and wind predictions using recent station
 measurements and refine rainfall using radar. Date, time, and location provide
 seasonal and daily context. Training happens separately from everyday prediction;
-Aurora's weights stay frozen.
+Aurora's weights stay frozen during forecasting. Radar motion also works without
+a trained checkpoint: it moves the latest measured rain field using motion
+estimated from two hours of observations, with Aurora filling unsupported areas.
 
 **Current status:** local M3/MPS forecasting and the training/evaluation workflows
 run successfully. Observation-based improvements remain experimental: the small
@@ -26,6 +28,9 @@ The [Leusden case study](experiments/leusden-20261024/report.md) records a full
 eight-hour comparison with a user-supplied Buienradar reference. A larger regional
 crop improved temperature agreement, but rainfall remained substantially too low.
 The revised station pilot also remains unqualified for routine prediction.
+The [radar and adaptation experiment](experiments/radar-methods-20261024/report.md)
+records the deterministic method, bounded training feasibility, and sparse
+inference checks. Broader rainfall qualification remains pending.
 
 ## How it works and what data is used
 
@@ -145,6 +150,21 @@ Diagnostics go to stderr. Requested horizons are 1–24 hours; eight hours is th
 training/evaluation target for external models. The elapsed part of the first
 clock hour may use measured radar rainfall and is identified in the result metadata.
 
+Choose a rainfall method explicitly; Aurora remains the default:
+
+```sh
+pixi run weather Leusden --hours 8 --rain-method aurora
+pixi run weather Leusden --hours 8 --rain-method radar-motion
+```
+
+`radar-motion` needs KNMI access but no trained checkpoint. It estimates pySTEPS
+optical flow once over the complete measured radar domain, then streams 96
+five-minute predictions into hourly totals. Missing pixels and trajectories from
+outside the domain retain Aurora, with coverage and fallback reasons in the JSON
+report. Dry valid observations use zero motion. Motion cannot reliably predict
+storm formation or guarantee useful skill eight hours ahead. Radar updates reuse
+Aurora forecasts; motion and hourly radar grids are shared between localities.
+
 After training and evaluating compatible external models, enable either or both:
 
 ```sh
@@ -156,7 +176,10 @@ pixi run weather Leusden --hours 8 \
 These paths must contain actual trained artifacts; the example files are not
 bundled pretrained corrections. Forecasting never retrains them. Missing fresh
 nearby stations cause a per-variable Aurora fallback; corrupt artifacts,
-incompatible schemas, and unavailable required radar inputs produce explicit errors.
+incompatible schemas, and unavailable required CNN inputs produce explicit errors.
+An omitted `--rain-method` with `--radar-adapter` preserves CNN behavior. Explicit
+`--rain-method cnn` requires that adapter. Contradictory options are rejected.
+Station calibration is independent of the rainfall method.
 
 ## Train and validate local adjustments
 
@@ -200,6 +223,33 @@ Aurora forecasts and prepared measured radar. Each case needs **24 past + 96 fut
 five-minute frames**. Preserve `RAD_NL25_RAC_RT_YYYYMMDDhhmm.h5` filenames. Historical
 RTCOR archive extraction remains a manual prerequisite.
 
+Checkpoint-free motion calibration/evaluation uses the same chronological manifest.
+Prepare full-domain observations with `prepare-radar-native --full-domain` (keep
+the default cropped preparation for CNN training). The selected product schema
+must have exact five-minute UTC boundaries and supported measured amounts; some
+older KNMI archive files are deliberately rejected rather than reinterpreted.
+
+```sh
+pixi run calibrate-rain --cases configs/radar-cases.example.json \
+  --output outputs/rain/blend.json
+pixi run evaluate-rain --cases configs/radar-cases.example.json \
+  --report outputs/rain/evaluation.json
+pixi run evaluate-rain --cases configs/radar-cases.example.json \
+  --rain-calibration outputs/rain/blend.json \
+  --report outputs/rain/blended-evaluation.json
+pixi run weather Leusden --hours 8 --rain-method radar-blend \
+  --rain-calibration outputs/rain/blend.json
+```
+
+Evaluation compares Aurora, radar persistence, FFT motion, pySTEPS motion, and the
+combined result without loading a CNN checkpoint. Calibration selects one weight
+per lead hour on validation only, requiring lower MAE without worse CSI at
+0.1 mm/hour. Artifacts carry checksums, case identities, and numerical/domain
+compatibility. A weight of zero retains Aurora's future rain; all methods retain
+the same measured portion of the first clock hour. No qualified blending artifact
+is bundled. The bounded pilot's new transfers were 146.6 MB of its 250 MB budget;
+incompatible historical files prevented independent train/validation/test splits.
+
 ```sh
 pixi run prepare-radar-native --frames /absolute/path/RAD_NL25_RAC_RT_*.h5 \
   --latitude 52.09 --longitude 5.12 --output data/prepared/radar/case.nc
@@ -216,6 +266,27 @@ wet events, and spatial skill. Old surface-head and six-hour radar adapters are
 incompatible. Use fresh output paths; valuable results are not silently overwritten.
 
 ## Performance, outputs, and checks
+
+Daily forecasts now request only needed hourly outputs plus six-hour bridge
+states (`sparse_forecasts = true` in the default configuration). Historical engine
+calls remain dense unless a lead schedule is explicitly supplied. Float32 MPS
+comparisons across multiple windows were exactly equal to dense inference.
+Forecast cache schema 3 records timestamp coverage and cannot reuse a cache
+missing a requested lead. Startup still dominates short uncached requests.
+
+The optional internal adaptation command performs one isolated rank-eight LoRA
+training step on cached ERA5 inputs, with a ten-minute timeout, the original
+48×64 grid, process-memory checks, and accelerator allocation checks. It discards
+updated weights and never affects forecasting:
+
+```sh
+pixi run adapter-feasibility --initialization 2024-01-01T06:00:00 \
+  --output outputs/adapter-feasibility-new
+```
+
+This experiment passed on M3/MPS; it demonstrates that one step fits, not useful
+adaptation or feasibility on a larger domain. Pixi supplies the compiler/OpenMP
+dependencies needed to build pySTEPS; no separate Python environment is needed.
 
 A measured eight-hour historical run on M3/MPS with cached inputs took **38.9 s
 with a cold engine**, **2.12 s with reused weights**, and **0.055 s for a cached

@@ -47,6 +47,10 @@ def parser() -> argparse.ArgumentParser:
     )
     weather.add_argument("--station-calibrator", type=Path)
     weather.add_argument(
+        "--rain-method", choices=("aurora", "radar-motion", "radar-blend", "cnn")
+    )
+    weather.add_argument("--rain-calibration", type=Path)
+    weather.add_argument(
         "--radar-adapter",
         type=Path,
         help="Trained native-grid radar rain adapter; uses measured KNMI history",
@@ -154,6 +158,7 @@ def parser() -> argparse.ArgumentParser:
     training.add_argument("--output", type=Path, required=True)
     training.add_argument("--steps", type=int)
     native = commands.add_parser("prepare-radar-native", parents=[common])
+    native.add_argument("--full-domain", action="store_true")
     native.add_argument("--frames", type=Path, nargs="+", required=True)
     native.add_argument("--latitude", type=float, required=True)
     native.add_argument("--longitude", type=float, required=True)
@@ -203,6 +208,18 @@ def parser() -> argparse.ArgumentParser:
     reference.add_argument("--reference", type=Path, required=True)
     reference.add_argument("--predictions", type=Path, nargs="+", required=True)
     reference.add_argument("--output", type=Path, required=True)
+    for name in ("calibrate-rain", "evaluate-rain"):
+        rain = commands.add_parser(name, parents=[common])
+        rain.add_argument("--cases", type=Path, required=True)
+        if name == "calibrate-rain":
+            rain.add_argument("--output", type=Path, required=True)
+        else:
+            rain.add_argument("--rain-calibration", type=Path)
+    feasibility = commands.add_parser("adapter-feasibility", parents=[common])
+    feasibility.add_argument(
+        "--initialization", type=datetime.fromisoformat, required=True
+    )
+    feasibility.add_argument("--output", type=Path, required=True)
     evaluate = commands.add_parser("evaluate", parents=[common])
     evaluate.add_argument("--prediction", type=Path, required=True)
     evaluate.add_argument("--stations", type=Path, nargs="+")
@@ -220,6 +237,16 @@ def parser() -> argparse.ArgumentParser:
 
 def dispatch(args: argparse.Namespace, config: Config, recorder: Recorder) -> object:
     """Dispatch only the selected command, keeping heavy imports lazy."""
+    if args.command == "adapter-feasibility":
+        from aurora_finetuning.adapter_feasibility import run_isolated
+
+        return run_isolated(config, args.initialization, args.output)
+    if args.command in ("calibrate-rain", "evaluate-rain"):
+        from aurora_finetuning.rain_calibration import calibrate_rain, evaluate_rain
+
+        if args.command == "calibrate-rain":
+            return calibrate_rain(config, args.cases, args.output, recorder)
+        return evaluate_rain(config, args.cases, args.rain_calibration, recorder)
     if args.command == "compare-reference":
         from aurora_finetuning.reference import compare_files
 
@@ -245,6 +272,10 @@ def dispatch(args: argparse.Namespace, config: Config, recorder: Recorder) -> ob
             location.longitude,
         )
         kwargs = {"radar_adapter": args.radar_adapter} if args.radar_adapter else {}
+        if args.rain_method is not None:
+            kwargs["rain_method"] = args.rain_method
+        if args.rain_calibration is not None:
+            kwargs["rain_calibration"] = args.rain_calibration
         if args.station_calibrator:
             kwargs["station_calibrator"] = args.station_calibrator
         return predict_weather(
@@ -268,7 +299,13 @@ def dispatch(args: argparse.Namespace, config: Config, recorder: Recorder) -> ob
                 recorder,
                 latitude=args.latitude,
                 longitude=args.longitude,
-                size=config.radar_patch_size if args.size is None else args.size,
+                size=(
+                    None
+                    if args.full_domain
+                    else config.radar_patch_size
+                    if args.size is None
+                    else args.size
+                ),
             )
             save_forecast(dataset, args.output)
         return {"radar": str(args.output)}
@@ -548,7 +585,12 @@ def main(argv: Sequence[str] | None = None) -> int:
 
             config = replace(config, hours=args.hours)
         with recorder.measure(f"command.{args.command}"):
-            if args.command in ("weather", "weather-setup"):
+            if args.command in (
+                "weather",
+                "weather-setup",
+                "calibrate-rain",
+                "evaluate-rain",
+            ):
                 # Provider/model libraries may print progress directly to stdout.
                 with redirect_stdout(sys.stderr):
                     result = dispatch(args, config, recorder)

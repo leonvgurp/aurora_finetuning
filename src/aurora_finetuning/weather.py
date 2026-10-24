@@ -6,6 +6,7 @@ import logging
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
+import numpy as np
 import requests
 import xarray as xr
 
@@ -124,6 +125,7 @@ def pipeline_identity() -> str:
                 sha256(directory / name)
                 for name in (
                     "model.py",
+                    "leads.py",
                     "engine.py",
                     "regional.py",
                     "preparation.py",
@@ -136,7 +138,11 @@ def pipeline_identity() -> str:
 
 
 def cached_grid(
-    config: Config, cycle: datetime, horizon: int, recorder: Recorder
+    config: Config,
+    cycle: datetime,
+    horizon: int,
+    recorder: Recorder,
+    requested_leads: list[int] | None = None,
 ) -> xr.Dataset | None:
     """Validate a cached forecast before constructing tensors or touching weights."""
     try:
@@ -144,17 +150,38 @@ def cached_grid(
     except FileNotFoundError:
         return None
     directory = config.root / "outputs/weather" / key
+    wanted = set(requested_leads or range(1, horizon + 1))
     for path in sorted(directory.glob("*.nc")):
-        if int(path.stem) < horizon:
-            continue
         manifest = path.with_suffix(".json")
         if not manifest.exists():
             raise ValueError(f"Incomplete forecast cache: {path}")
-        expected = json.loads(manifest.read_text())["sha256"]
+        info = json.loads(manifest.read_text())
+        coverage = info.get("lead_hours")
+        if not isinstance(coverage, list) or info.get("schema") != 3:
+            raise ValueError(f"Incompatible forecast cache coverage: {path}")
+        if not wanted.issubset(coverage):
+            continue
+        expected = info["sha256"]
         if sha256(path) != expected:
             raise ValueError(f"Modified forecast cache: {path}")
         with recorder.measure("forecast.read_cache"), xr.open_dataset(path) as source:
             result = source.load()
+        actual = [
+            int(
+                (
+                    datetime.fromisoformat(str(t.astype("datetime64[us]"))) - cycle
+                ).total_seconds()
+                / 3600
+            )
+            for t in result.time.values
+        ]
+        if actual != coverage or len(actual) != len(set(actual)):
+            raise ValueError(f"Forecast cache lead coverage mismatch: {path}")
+        if any(
+            np.datetime64(cycle + timedelta(hours=lead), "ns") != stamp
+            for lead, stamp in zip(actual, result.time.values, strict=True)
+        ):
+            raise ValueError(f"Forecast cache has non-hourly valid times: {path}")
         recorder.inputs[str(path)] = expected
         return result
     return None
@@ -168,8 +195,8 @@ def cache_identity(config: Config, cycle: datetime, adapter: Path | None) -> str
         for kind in ("single", "pressure")
     ]
     identity = {
-        "version": 2,
-        "output_schema": 2,
+        "version": 3,
+        "output_schema": 3,
         "code": pipeline_identity(),
         "precision": config.precision,
         "initialization": cycle.isoformat(),
@@ -198,6 +225,8 @@ def predict_weather(
     radar_adapter: Path | None = None,
     station_calibrator: Path | None = None,
     engine: ForecastEngine | None = None,
+    rain_method: str | None = None,
+    rain_calibration: Path | None = None,
 ) -> dict[str, object]:
     """Retrieve fresh inputs, reuse or generate a regional forecast, then query it."""
     validate_location(latitude, longitude)
@@ -205,6 +234,19 @@ def predict_weather(
         raise ValueError(
             "Legacy surface-head adapters are unsupported; use external calibrators"
         )
+    method = rain_method or ("cnn" if radar_adapter is not None else "aurora")
+    if method not in ("aurora", "cnn", "radar-motion", "radar-blend"):
+        raise ValueError("Unknown rainfall method")
+    if (method == "cnn") != (radar_adapter is not None):
+        raise ValueError(
+            "CNN rainfall requires --radar-adapter; other methods reject it"
+        )
+    if (method == "radar-blend") != (rain_calibration is not None):
+        raise ValueError("Only radar-blend requires --rain-calibration")
+    if rain_calibration is not None:
+        from aurora_finetuning.rain_calibration import load_weights
+
+        load_weights(rain_calibration, config)
     now = now or datetime.now(UTC)
     start = start or now
     if start.tzinfo is None or now.tzinfo is None:
@@ -223,25 +265,49 @@ def predict_weather(
     horizon = int((end - cycle).total_seconds() / 3600)
     if not 1 <= horizon <= 48:
         raise ValueError("Requested window exceeds the 48-hour internal rollout limit")
-    dataset = cached_grid(config, cycle, horizon, recorder)
+    requested = (
+        list(range(horizon - config.hours + 1, horizon + 1))
+        if config.sparse_forecasts
+        else None
+    )
+    dataset = cached_grid(config, cycle, horizon, recorder, requested)
     if dataset is None:
         ice = find_sea_ice(config, cycle, recorder)
         pull_ifs(config, cycle, recorder, ice)
-        dataset = cached_grid(config, cycle, horizon, recorder)
+        dataset = cached_grid(config, cycle, horizon, recorder, requested)
         if dataset is None:
             if engine is None:
                 with ForecastEngine(config, recorder) as session:
-                    dataset = session.predict(cycle, horizon, "ifs")
+                    dataset = (
+                        session.predict(
+                            cycle, horizon, "ifs", requested_leads=requested
+                        )
+                        if requested
+                        else session.predict(cycle, horizon, "ifs")
+                    )
             else:
                 if engine.config != config:
                     raise ValueError("Forecast engine configuration mismatch")
-                dataset = engine.predict(cycle, horizon, "ifs")
+                dataset = (
+                    engine.predict(cycle, horizon, "ifs", requested_leads=requested)
+                    if requested
+                    else engine.predict(cycle, horizon, "ifs")
+                )
             query_grid(dataset, latitude, longitude, config.hours, start)
             key = cache_identity(config, cycle, None)
-            path = config.root / "outputs/weather" / key / f"{horizon:02d}.nc"
+            suffix = f"-{requested[0]:02d}" if requested else ""
+            path = config.root / "outputs/weather" / key / f"{horizon:02d}{suffix}.nc"
             dataset.attrs["available_utc"] = datetime.now(UTC).isoformat()
             save_forecast(dataset, path)
-            write_json(path.with_suffix(".json"), {"sha256": sha256(path), "key": key})
+            write_json(
+                path.with_suffix(".json"),
+                {
+                    "sha256": sha256(path),
+                    "key": key,
+                    "schema": 3,
+                    "lead_hours": requested or list(range(1, horizon + 1)),
+                },
+            )
     result = query_grid(dataset, latitude, longitude, config.hours, start)
     if station_calibrator is not None:
         from aurora_finetuning.station_data import apply_live_stations
@@ -261,6 +327,11 @@ def predict_weather(
             longitude,
             adapter,
         )
+    if method in ("radar-motion", "radar-blend"):
+        from aurora_finetuning.radar_nowcast import apply_motion
+
+        result = apply_motion(result, config, recorder, now, rain_calibration)
+    result["rain_method"] = method
     result["initialization_age_hours"] = (
         now.astimezone(UTC).replace(tzinfo=None) - cycle
     ).total_seconds() / 3600
@@ -279,7 +350,7 @@ def predict_weather(
     result["requested_components"] = {
         "aurora": True,
         "stations": station_calibrator is not None,
-        "radar": radar_adapter is not None,
+        "radar": method != "aurora",
     }
     result["variable_sources"] = {
         name: sorted({str(row.get(f"{name}_source", "unknown")) for row in rows})
@@ -295,7 +366,7 @@ def predict_weather(
         "Components requested: Aurora, stations=%s, radar=%s; model leads %s–%s h; "
         "station cutoff=%s; radar cutoff=%s; actual sources=%s",
         station_calibrator is not None,
-        radar_adapter is not None,
+        method != "aurora",
         leads[0],
         leads[-1],
         result.get("station_cutoff_utc", "none"),
@@ -305,7 +376,9 @@ def predict_weather(
     LOGGER.info(
         "Correction identities (SHA256): stations=%s; radar=%s",
         result.get("station_calibrator_sha256", "none"),
-        result.get("radar_adapter_sha256", "none"),
+        result.get(
+            "radar_adapter_sha256", result.get("rain_calibration_sha256", "none")
+        ),
     )
     LOGGER.warning(
         "Experimental Aurora forecast at ~25 km resolution; initialized %s UTC; "
