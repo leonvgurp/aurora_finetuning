@@ -103,7 +103,11 @@ Radar reports raw adapter output, selected combined output, Aurora, persistence,
 motion extrapolation and the trained radar-only control. Native-grid verification
 uses shared finite masks for Aurora and learned methods. Motion extrapolation
 can leave the observed domain; it receives an additional paired Aurora score
-on exactly its own finite support. Area aggregation additionally tests coarse-grid amounts.
+on exactly its own finite support, at both native and coarse resolutions. Area
+aggregation averages predictions and observations over the same native pixels.
+Comparisons with no overlapping pixels have count zero, coverage zero, and null
+error scores. They remain visible in coverage reports and are excluded from error
+averages and bootstrap estimates; other methods retain their own valid coverage.
 Fractions skill uses complete neighbourhoods at 1/5/10 km; neighbourhoods outside
 coverage are undefined, not zero skill. Case bootstrap intervals resample cases,
 not correlated pixels. With one case intervals are unavailable. Adjacent cases may

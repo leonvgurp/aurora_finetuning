@@ -10,9 +10,11 @@ import xarray as xr
 from aurora_finetuning.artifacts import atomic_output
 from aurora_finetuning.config import Config
 from aurora_finetuning.forecast import query_grid
+from aurora_finetuning.grid import Grid
 from aurora_finetuning.observations import normalize_stations
 from aurora_finetuning.rainfall_metrics import (
     bootstrap_cases,
+    coarse_grid_report,
     fractions_skill,
     hourly_report,
     motion_forecast,
@@ -48,6 +50,42 @@ def test_motion_extrapolates_without_longitude_wrap() -> None:
     future = motion_forecast(history, 30)
     assert future[11, 15] == 1
     assert np.isnan(future[:, :2]).all()
+
+
+def test_coarse_rainfall_uses_identical_native_pixel_support() -> None:
+    grid = Grid(np.array([52.0]), np.array([5.0]))
+    latitude = np.array([[52.04, 52.04], [51.96, 51.96]])
+    longitude = np.array([[4.96, 5.04], [4.96, 5.04]])
+    observed = np.tile([[0.0, 10.0], [0.0, 10.0]], (8, 1, 1))
+    predicted = observed.copy()
+    predicted[:, :, 1] = np.nan
+    report = coarse_grid_report(predicted, observed, latitude, longitude, grid, 0.25)
+    hourly = report["by_lead_hour"]
+    assert isinstance(hourly, list)
+    assert all(row["mae"] == 0 and row["count"] == 1 for row in hourly)
+    native = hourly_report(predicted, observed)
+    assert native["coverage_fraction"] == 0.5
+    total = report["eight_hour_total"]
+    assert isinstance(total, dict) and total["mae"] == 0
+
+
+def test_no_overlap_is_unavailable_with_zero_coverage() -> None:
+    grid = Grid(np.array([52.0]), np.array([5.0]))
+    latitude, longitude = np.array([[52.0, 52.0]]), np.array([[5.0, 5.04]])
+    observed = np.ones((8, 1, 2))
+    predicted = np.full_like(observed, np.nan)
+    for report in (
+        hourly_report(predicted, observed),
+        coarse_grid_report(predicted, observed, latitude, longitude, grid, 0.25),
+    ):
+        hourly, total = report["by_lead_hour"], report["eight_hour_total"]
+        assert isinstance(hourly, list) and isinstance(total, dict)
+        for scores in [*hourly, total]:
+            assert scores["count"] == 0 and scores["coverage_fraction"] == 0
+            assert all(scores[key] is None for key in ("mae", "rmse", "bias"))
+    # Missing cases must not become zero-error observations in aggregate estimates.
+    errors = np.stack((np.ones(8), np.full(8, np.nan), np.full(8, 3.0)))
+    assert bootstrap_cases(errors)["ci95"] == [[1.0] * 8, [3.0] * 8]
 
 
 def test_atomic_failure_and_competing_writer_preserve_existing(tmp_path: Path) -> None:

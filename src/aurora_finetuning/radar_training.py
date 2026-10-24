@@ -11,7 +11,6 @@ import xarray as xr
 
 from aurora_finetuning.acquisition import sha256
 from aurora_finetuning.config import Config
-from aurora_finetuning.evaluation import metrics
 from aurora_finetuning.grid import FloatArray
 from aurora_finetuning.model import check_device, check_memory
 from aurora_finetuning.radar_data import history_at, validate_native
@@ -438,9 +437,9 @@ def evaluate_adapter(
 ) -> dict[str, object]:
     """Score deterministic test tiles, all hours, raw and selected refinements."""
     from aurora_finetuning.grid import make_grid
-    from aurora_finetuning.observations import aggregate_radar
     from aurora_finetuning.rainfall_metrics import (
         bootstrap_cases,
+        coarse_grid_report,
         hourly_report,
         motion_forecast,
     )
@@ -520,7 +519,7 @@ def evaluate_adapter(
             tiles.append(list(origin))
         if control is None:
             del arrays["radar_only"]
-        # Every method is scored on exactly the same observed/forecastable cells.
+        # Keep motion's missing coverage separate from the other methods.
         mask = np.isfinite(observations)
         for name, values in arrays.items():
             if name != "radar_motion":
@@ -534,34 +533,37 @@ def evaluate_adapter(
             lat = np.asarray(geometry.latitude.values, dtype=float)
             lon = np.asarray(geometry.longitude.values, dtype=float)
         grid = make_grid(config)
-        coarse_o = np.stack(
-            [aggregate_radar(v, lat, lon, grid, config.resolution) for v in measured]
-        )
         for name, values in arrays.items():
             values = np.where(mask, values, np.nan)
+            support = np.isfinite(values) & np.isfinite(measured)
             report = hourly_report(values, measured)
             if name == "radar_motion":
-                support = np.isfinite(values) & np.isfinite(measured)
-                report["aurora_on_motion_support"] = hourly_report(
-                    np.where(support, arrays["aurora"], np.nan),
-                    np.where(support, measured, np.nan),
+                paired_aurora = np.where(support, arrays["aurora"], np.nan)
+                paired_observations = np.where(support, measured, np.nan)
+                paired_report = hourly_report(paired_aurora, paired_observations)
+                paired_report["aurora_grid"] = coarse_grid_report(
+                    paired_aurora,
+                    paired_observations,
+                    lat,
+                    lon,
+                    grid,
+                    config.resolution,
                 )
+                report["aurora_on_motion_support"] = paired_report
                 report["support_note"] = (
                     "Motion has limited spatial support; "
                     "paired Aurora uses identical support"
                 )
-            coarse_p = np.stack(
-                [aggregate_radar(v, lat, lon, grid, config.resolution) for v in values]
+            report["aurora_grid"] = coarse_grid_report(
+                values, measured, lat, lon, grid, config.resolution
             )
-            report["aurora_grid"] = {
-                "by_lead_hour": [metrics(coarse_p[i], coarse_o[i]) for i in range(8)],
-                "eight_hour_total": metrics(coarse_p.sum(0), coarse_o.sum(0)),
-            }
             row_report[name] = report
             case_errors.setdefault(name, []).append(
                 [
-                    float(np.nanmean(np.abs(values[i] - measured[i])))
-                    if mask[i].any()
+                    float(
+                        np.abs(values[i][support[i]] - measured[i][support[i]]).mean()
+                    )
+                    if support[i].any()
                     else float("nan")
                     for i in range(8)
                 ]
@@ -570,7 +572,7 @@ def evaluate_adapter(
         check_memory(config)
     return {
         "test": output,
-        "spatial_sampling": "deterministic tiled interiors; shared finite masks",
+        "spatial_sampling": "tiled interiors; shared masks, motion paired separately",
         "uncertainty": {
             name: bootstrap_cases(np.asarray(values), config.seed)
             for name, values in case_errors.items()

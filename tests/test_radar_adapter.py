@@ -1,6 +1,7 @@
 """Measured radar conditioning, leakage guards and real small-model training."""
 
 import json
+import warnings
 from collections.abc import Iterator
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -254,7 +255,9 @@ def case_files(
     }
 
 
-def test_training_checkpoint_and_heldout_evaluation(tmp_path: Path) -> None:
+def test_training_checkpoint_and_heldout_evaluation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     config = Config(root=tmp_path, device="cpu", radar_patch_size=128)
     manifest = tmp_path / "cases.json"
     records = {
@@ -291,6 +294,26 @@ def test_training_checkpoint_and_heldout_evaluation(tmp_path: Path) -> None:
     assert isinstance(result, list) and len(result) == 1
     assert result[0]["radar_conditioned"]["hourly"]["count"] == 32
     assert "aurora" in result[0] and "radar_persistence" in result[0]
+    monkeypatch.setattr(
+        "aurora_finetuning.rainfall_metrics.motion_forecast",
+        lambda history, minutes: np.full_like(history[-1], np.nan),
+    )
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", RuntimeWarning)
+        unavailable = evaluate_adapter(config, manifest, checkpoint, Recorder())
+    unavailable_cases = unavailable["test"]
+    assert isinstance(unavailable_cases, list)
+    motion = unavailable_cases[0]["radar_motion"]
+    assert motion["hourly"]["count"] == 0
+    assert motion["coverage_fraction"] == 0
+    for comparison in (motion, motion["aurora_on_motion_support"]):
+        assert comparison["aurora_grid"]["eight_hour_total"]["mae"] is None
+        assert all(
+            row["count"] == 0 and row["coverage_fraction"] == 0
+            for row in comparison["aurora_grid"]["by_lead_hour"]
+        )
+    assert unavailable_cases[0]["aurora"]["hourly"] == result[0]["aurora"]["hourly"]
+    json.dumps(unavailable, allow_nan=False)
     checkpoint.write_bytes(b"changed")
     with pytest.raises(ValueError, match="checksum"):
         load_radar_adapter(checkpoint, config, None, Recorder())

@@ -3,7 +3,48 @@
 import numpy as np
 
 from aurora_finetuning.evaluation import metrics
-from aurora_finetuning.grid import FloatArray
+from aurora_finetuning.grid import FloatArray, Grid
+from aurora_finetuning.observations import aggregate_radar
+
+
+def coverage_metrics(
+    prediction: FloatArray, observation: FloatArray
+) -> dict[str, float | int | None]:
+    """Score matched values and retain unavailable comparisons as zero coverage."""
+    report = metrics(prediction, observation)
+    report["coverage_fraction"] = (
+        float((np.isfinite(prediction) & np.isfinite(observation)).mean())
+        if prediction.size
+        else 0.0
+    )
+    return report
+
+
+def coarse_grid_report(
+    prediction: FloatArray,
+    observation: FloatArray,
+    latitude: FloatArray,
+    longitude: FloatArray,
+    grid: Grid,
+    resolution: float,
+) -> dict[str, object]:
+    """Aggregate each hour's predictions and observations over identical pixels."""
+    if prediction.shape != observation.shape or prediction.shape[0] != 8:
+        raise ValueError("Rainfall verification requires eight matched hourly grids")
+    support = np.isfinite(prediction) & np.isfinite(observation)
+    coarse_p, coarse_o = (
+        np.stack(
+            [
+                aggregate_radar(values, latitude, longitude, grid, resolution)
+                for values in np.where(support, field, np.nan)
+            ]
+        )
+        for field in (prediction, observation)
+    )
+    return {
+        "by_lead_hour": [coverage_metrics(coarse_p[i], coarse_o[i]) for i in range(8)],
+        "eight_hour_total": coverage_metrics(coarse_p.sum(0), coarse_o.sum(0)),
+    }
 
 
 def event_scores(
@@ -65,22 +106,24 @@ def hourly_report(prediction: FloatArray, observation: FloatArray) -> dict[str, 
         hours.append(
             {
                 "lead_hour": index + 1,
-                **metrics(p, o),
+                **coverage_metrics(p, o),
                 "events": {str(t): event_scores(p, o, t) for t in (0.1, 1.0)},
                 "fractions_skill": {
                     str(t): {str(k): fractions_skill(p, o, k, t) for k in (1, 5, 10)}
                     for t in (0.1, 1.0)
                 },
-                "cumulative": metrics(
+                "cumulative": coverage_metrics(
                     prediction[: index + 1].sum(0), observation[: index + 1].sum(0)
                 ),
             }
         )
     return {
-        "hourly": metrics(prediction, observation),
+        "hourly": coverage_metrics(prediction, observation),
         "by_lead_hour": hours,
-        "eight_hour_total": metrics(prediction.sum(0), observation.sum(0)),
-        "coverage_fraction": float(np.isfinite(observation).mean()),
+        "eight_hour_total": coverage_metrics(prediction.sum(0), observation.sum(0)),
+        "coverage_fraction": float(
+            (np.isfinite(prediction) & np.isfinite(observation)).mean()
+        ),
     }
 
 
