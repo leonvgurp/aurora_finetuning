@@ -1,7 +1,7 @@
 """Strict ECMWF IFS initialization retrieval, with no fabricated missing fields."""
 
 import warnings
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 import cfgrib
@@ -295,6 +295,7 @@ def pull_ifs(
                     manifest,
                     {
                         "source": "ECMWF IFS",
+                        "available_utc": datetime.now(UTC).isoformat(),
                         "request": request,
                         "soil_request": soil_request,
                         "grid": grid.describe(),

@@ -25,6 +25,7 @@ dependencies = [
 
 [project.scripts]
 aurora-finetuning = "aurora_finetuning.cli:main"
+aurora-experiment = "aurora_finetuning.experiment_cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/aurora_finetuning"]
@@ -55,11 +56,30 @@ pytest = ">=8,<10"
 types-requests = ">=2.33.0.20261006,<3"
 c-compiler = ">=2.0.0,<3"
 llvm-openmp = ">=23.1.4,<24"
+setuptools = "<82"
+pandas-stubs = ">=3.0.5.260914,<4"
+
+[tool.pixi.feature.analysis.dependencies]
+pandas = ">=3.1.0,<4"
+matplotlib = ">=3.11.2,<4"
+jupyterlab = ">=4.6.4,<5"
+nbconvert = ">=7.17.2,<8"
+ipykernel = ">=7.4.0,<8"
 
 [tool.pixi.environments]
-default = { features = ["dev"], solve-group = "default" }
+default = { features = ["dev", "analysis"], solve-group = "default" }
 
 [tool.pixi.tasks]
+experiment-demo = "python -m aurora_finetuning.experiment_demo"
+experiment-plan = "aurora-experiment plan"
+experiment-fetch = "aurora-experiment fetch"
+experiment-run = "aurora-experiment run"
+experiment-collect = "aurora-experiment collect"
+experiment-report = "aurora-experiment report"
+experiment-notebook = "jupyter lab notebooks/results.ipynb"
+notebook-check = "jupyter nbconvert --to notebook --execute notebooks/results.ipynb --output results-executed.ipynb --output-dir outputs/notebooks --ExecutePreprocessor.timeout=120"
+experiment-public = "python -m aurora_finetuning.public_forecasts"
+
 weather = "aurora-finetuning weather --config configs/default.toml"
 weather-setup = "aurora-finetuning weather-setup --config configs/default.toml"
 prepare-radar-native = "aurora-finetuning prepare-radar-native --config configs/default.toml"

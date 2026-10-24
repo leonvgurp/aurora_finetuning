@@ -88,3 +88,7 @@ mlruns/
 Thumbs.db
 *.swp
 *.swo
+
+# Notebook runtime state (keep source notebooks tracked)
+.ipynb_checkpoints/
+.jupyter/

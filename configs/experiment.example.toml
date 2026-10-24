@@ -1,0 +1,53 @@
+# Structural example, NOT a downloaded or qualified benchmark dataset.
+# All paths are relative to this TOML. Supply real artifacts before running.
+id = "nl-pilot"
+track = "retrospective"
+output = "../outputs/experiments/nl-pilot"
+hours = 8
+seed = 42
+timeout_seconds = 1800
+max_download_bytes = 250000000
+max_storage_bytes = 26843545600
+
+[[cases]]
+id = "winter-01"
+issue = "2026-01-12T12:00:00+00:00"
+initialization = "2026-01-12T06:00:00+00:00"
+split = "train"
+regime = "unclassified"
+availability = "retrospective"
+observations = "../data/experiments/winter-01/observations.nc"
+history = "../data/experiments/winter-01/history.nc"
+
+[[methods]]
+id = "aurora-original"
+kind = "aurora"
+config = "default.toml"
+source = "era5"
+
+[[methods]]
+id = "harmonie"
+kind = "cached"
+[methods.paths]
+winter-01 = "../data/experiments/winter-01/harmonie-normalized.nc"
+
+[[methods]]
+id = "persistence"
+kind = "persistence"
+
+[[methods]]
+id = "dry"
+kind = "dry"
+
+# Existing research commands can be bridged as bounded jobs.
+# Arguments resolve relative to this TOML; use paths relative to configs/ below.
+# The runner owns --report; do not include it in arguments.
+# [[jobs]]
+# id = "radar-evaluation"
+# phase = "run"
+# arguments = ["evaluate-rain", "--config", "default.toml", "--cases", "radar-cases.example.json"]
+#
+# [[jobs]]
+# id = "harmonie-acquisition"
+# phase = "fetch"
+# arguments = ["pull-knmi", "--config", "default.toml", "--dataset", "harmonie_arome_cy43_p1", "--dataset-version", "1.0", "--begin", "EXACT_FIRST_FILENAME", "--end", "EXACT_LAST_FILENAME", "--max-files", "1"]
