@@ -519,3 +519,29 @@ def test_cache_hit_does_not_prepare_tensors_or_audit_network(
     monkeypatch.setattr(weather, "audit_ifs", forbidden)
     weather.predict_weather(config, 52.1, 5.1, Recorder(), now=now)
     assert calls == [24]
+
+
+def test_new_cycle_checked_before_reusing_old_forecast(
+    live_fixture: tuple[Config, datetime, list[int]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config, cycle, calls = live_fixture
+    initial = cycle.replace(tzinfo=UTC)
+    weather.predict_weather(config, 52, 5, Recorder(), now=initial)
+    seen = []
+
+    def audit(stamp: datetime, recorder: Recorder) -> dict[str, object]:
+        seen.append(stamp)
+        return audit_result()
+
+    monkeypatch.setattr(weather, "audit_ifs", audit)
+    # A cache for 06 UTC must not prevent auditing the 12 UTC cycle.
+    newer = initial + timedelta(hours=6)
+    assert weather.available_cycle(config, newer, Recorder()).hour == 12
+    assert seen == [cycle + timedelta(hours=6)]
+    # Within ten minutes, reuse the selection without another network call.
+    assert (
+        weather.available_cycle(config, newer + timedelta(minutes=1), Recorder()).hour
+        == 12
+    )
+    assert len(seen) == 1

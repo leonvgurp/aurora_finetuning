@@ -21,7 +21,7 @@ from aurora_finetuning.seasonal import calendar_features
 from aurora_finetuning.telemetry import Recorder, write_json
 
 VARIABLES = ("temperature_c", "pressure_hpa", "wind_u_ms", "wind_v_ms")
-VERSION = "station-ridge-v1"
+VERSION = "station-ridge-v2"
 FEATURES = (
     "forecast",
     "lead",
@@ -45,6 +45,7 @@ FEATURES = (
     "missing_6h",
     "missing_24h",
     "missing_72h",
+    "latest_observation",
 )
 
 
@@ -97,13 +98,13 @@ def recent_features(
     summaries: list[FloatArray] = []
     offsets: list[float] = []
     if variable not in observations:
-        return np.zeros(14), False
+        return np.zeros(len(FEATURES) - 8), False
     window = observations.sel(
         time=slice(np.datetime64(cutoff - timedelta(hours=72)), np.datetime64(cutoff))
     )
     window = station_geometry(window)
     if not window.sizes.get("time", 0):
-        return np.zeros(14), False
+        return np.zeros(len(FEATURES) - 8), False
     distance = distances(
         latitude,
         longitude,
@@ -188,6 +189,9 @@ def recent_features(
                     ),
                 ],
                 (~np.isfinite(raw)).astype(float),
+                # Cold starts may have no eligible archived forecast residual.
+                # Preserve the actual observed state rather than only its trend.
+                [values[latest]],
             )
         )
         summaries.append(summary)
@@ -195,7 +199,7 @@ def recent_features(
         if distance[index] < 1e-6 or len(summaries) == 4:
             break
     if not summaries:
-        return np.zeros(14), False
+        return np.zeros(len(FEATURES) - 8), False
     weights = 1 / np.maximum(offsets, 1e-6)
     result: FloatArray = np.average(np.stack(summaries), axis=0, weights=weights)
     return result, True

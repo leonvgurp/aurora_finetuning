@@ -1,0 +1,60 @@
+{
+  "source": "Buienradar; user-supplied manual snapshot",
+  "locality": "Leusden",
+  "latitude": 52.1168945,
+  "longitude": 5.40476582,
+  "issued_utc": null,
+  "interval_convention_verified": false,
+  "rainfall_interval_assumption": "hour-ending amounts",
+  "purpose": "single-case development target; not observed truth",
+  "hourly": [
+    {
+      "time": "2026-10-24T16:00:00+02:00",
+      "interval_start": "2026-10-24T15:00:00+02:00",
+      "temperature_c": 12,
+      "precipitation_mm": 0
+    },
+    {
+      "time": "2026-10-24T17:00:00+02:00",
+      "interval_start": "2026-10-24T16:00:00+02:00",
+      "temperature_c": 11,
+      "precipitation_mm": 0
+    },
+    {
+      "time": "2026-10-24T18:00:00+02:00",
+      "interval_start": "2026-10-24T17:00:00+02:00",
+      "temperature_c": 11,
+      "precipitation_mm": 0
+    },
+    {
+      "time": "2026-10-24T19:00:00+02:00",
+      "interval_start": "2026-10-24T18:00:00+02:00",
+      "temperature_c": 10,
+      "precipitation_mm": 1.2
+    },
+    {
+      "time": "2026-10-24T20:00:00+02:00",
+      "interval_start": "2026-10-24T19:00:00+02:00",
+      "temperature_c": 10,
+      "precipitation_mm": 1.5
+    },
+    {
+      "time": "2026-10-24T21:00:00+02:00",
+      "interval_start": "2026-10-24T20:00:00+02:00",
+      "temperature_c": 9,
+      "precipitation_mm": 0.5
+    },
+    {
+      "time": "2026-10-24T22:00:00+02:00",
+      "interval_start": "2026-10-24T21:00:00+02:00",
+      "temperature_c": 9,
+      "precipitation_mm": 1.4
+    },
+    {
+      "time": "2026-10-24T23:00:00+02:00",
+      "interval_start": "2026-10-24T22:00:00+02:00",
+      "temperature_c": 9,
+      "precipitation_mm": 3
+    }
+  ]
+}

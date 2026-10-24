@@ -1,0 +1,14 @@
+# Development profile from the 2026-10-24 reference comparison, not a skill claim.
+# Requires separately prepared inputs and verified model assets in this root.
+root = "../outputs/leusden-development-20261024/larger"
+north = 59.0
+south = 44.0
+west = -6.0
+east = 17.0
+resolution = 0.25
+hours = 8
+device = "mps"
+precision = "float32"
+max_memory_gb = 12.0
+max_download_gb = 2.0
+max_storage_gb = 25.0

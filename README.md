@@ -17,6 +17,16 @@ station pilot improved pressure but worsened temperature and wind, and trained
 radar refinement still needs representative held-out evaluation. External models
 are enabled explicitly; the default forecast uses Aurora alone.
 
+Every live request reports requested components, actual per-variable sources,
+initialization age, model lead hours, correction hashes, and observation cutoffs
+to stderr. Newer input-cycle availability is checked before using an older
+forecast cache; availability checks are reused for up to ten minutes.
+
+The [Leusden case study](experiments/leusden-20261024/report.md) records a full
+eight-hour comparison with a user-supplied Buienradar reference. A larger regional
+crop improved temperature agreement, but rainfall remained substantially too low.
+The revised station pilot also remains unqualified for routine prediction.
+
 ## How it works and what data is used
 
 ```text
@@ -176,6 +186,12 @@ Ridge regression models use forecast values, lead time, cyclic date/time feature
 location, recent trends, and residual summaries. Up to four suitable stations within
 100 km supply local context. Regularization, seasonal features, and per-hour
 correction weights are selected on validation data, not test observations.
+
+Station checkpoints now use `station-ridge-v2`, adding the latest observed value
+for cold starts without eligible archived forecast residuals. Re-run
+`prepare-stations` and `train-stations` for old artifacts; v1 checkpoints are
+rejected rather than interpreted with the new feature layout. Training still
+selects regularization and blending using historical validation data only.
 
 ### Rainfall radar
 

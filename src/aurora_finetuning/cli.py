@@ -195,6 +195,14 @@ def parser() -> argparse.ArgumentParser:
     bench.add_argument("--compare-precision", action="store_true")
     bench.add_argument("--hours", type=int)
     bench.add_argument("--reference", type=Path)
+    reference = commands.add_parser(
+        "compare-reference",
+        parents=[common],
+        help="Compare saved local forecasts with a fixed reference forecast",
+    )
+    reference.add_argument("--reference", type=Path, required=True)
+    reference.add_argument("--predictions", type=Path, nargs="+", required=True)
+    reference.add_argument("--output", type=Path, required=True)
     evaluate = commands.add_parser("evaluate", parents=[common])
     evaluate.add_argument("--prediction", type=Path, required=True)
     evaluate.add_argument("--stations", type=Path, nargs="+")
@@ -212,6 +220,10 @@ def parser() -> argparse.ArgumentParser:
 
 def dispatch(args: argparse.Namespace, config: Config, recorder: Recorder) -> object:
     """Dispatch only the selected command, keeping heavy imports lazy."""
+    if args.command == "compare-reference":
+        from aurora_finetuning.reference import compare_files
+
+        return compare_files(args.reference, args.predictions, args.output)
     if args.command == "weather-setup":
         from aurora_finetuning.weather import setup_weather
 

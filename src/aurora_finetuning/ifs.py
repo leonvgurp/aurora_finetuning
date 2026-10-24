@@ -1,5 +1,6 @@
 """Strict ECMWF IFS initialization retrieval, with no fabricated missing fields."""
 
+import warnings
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
@@ -10,7 +11,7 @@ from ecmwf.opendata import Client
 
 from aurora_finetuning.acquisition import LEVELS, SURFACE, http_session, sha256
 from aurora_finetuning.config import Config
-from aurora_finetuning.grid import make_grid
+from aurora_finetuning.grid import Grid, make_grid
 from aurora_finetuning.preparation import canonical, require_units, subset
 from aurora_finetuning.telemetry import Recorder, write_json
 
@@ -100,10 +101,15 @@ def audit_ifs(initialization: datetime, recorder: Recorder) -> dict[str, object]
             )
             with recorder.measure("download.ifs.audit_index"):
                 response = session.get(url, timeout=(10, 60))
-                response.raise_for_status()
-                records = [
-                    json.loads(line) for line in response.text.splitlines() if line
-                ]
+                # Unpublished cycles are expected during live cycle selection.
+                if response.status_code != 404:
+                    response.raise_for_status()
+                records = (
+                    [json.loads(line) for line in response.text.splitlines() if line]
+                    if response.status_code != 404
+                    else []
+                )
+            response.raise_for_status()
             surface = {
                 str(r.get("param"))
                 for r in records
@@ -280,53 +286,7 @@ def pull_ifs(
             transferred = sum(file.stat().st_size for file in grib_paths)
             recorder.network_bytes += transferred
             with recorder.measure("prepare.ifs.grib"):
-                chunks: list[xr.Dataset] = []
-                datasets = [
-                    dataset
-                    for file in grib_paths
-                    for dataset in cfgrib.open_datasets(
-                        str(file), backend_kwargs={"indexpath": ""}
-                    )
-                ]
-                for ds in datasets:
-                    try:
-                        # Height/depth describe each variable, not a shared axis.
-                        # Keeping scalar 2/10/100 m coordinates makes xr.merge
-                        # reject otherwise compatible surface fields.
-                        chunks.append(subset(regional_grib_field(ds), grid).load())
-                    finally:
-                        ds.close()
-                merged = xr.merge(chunks, compat="no_conflicts")
-                if kind == "single":
-                    # cfgrib emits CDS-like short names for surface fields.
-                    merged = merged.rename(
-                        {
-                            name: target
-                            for name, target in IFS_SURFACE.items()
-                            if name in merged and target not in merged
-                        }
-                    )
-                    merged = merged.rename(
-                        {
-                            name: target
-                            for name, target in (("st", "stl1"), ("swvl", "swvl1"))
-                            if name in merged and target not in merged
-                        }
-                    )
-                    if ice is not None:
-                        merged["siconc"] = ice
-                    missing = set(SURFACE) - set(merged.data_vars)
-                    if missing:
-                        raise ValueError(
-                            f"Public IFS is missing required fields {sorted(missing)}; "
-                            "live forecasting remains unavailable for this product"
-                        )
-                if "time" not in merged.dims:
-                    merged = merged.expand_dims(time=[np.datetime64(time, "ns")])
-                merged.attrs.update(
-                    source="ECMWF IFS step-zero cycles", experimental="true"
-                )
-                validate_ifs_units(merged, kind)
+                merged = decode_grib(grib_paths, grid, kind, time, ice)
                 from aurora_finetuning.model import save_forecast
 
                 save_forecast(merged, path)
@@ -421,3 +381,69 @@ def sea_ice_supplement(path: Path, time: datetime, config: Config) -> xr.DataArr
         if not isinstance(result, xr.DataArray):
             raise TypeError("Sea-ice supplement did not yield a data array")
         return result
+
+
+def decode_grib(
+    grib_paths: list[Path],
+    grid: Grid,
+    kind: str,
+    time: datetime,
+    ice: xr.DataArray | None = None,
+) -> xr.Dataset:
+    """Decode verified step-zero GRIB fields onto an explicit regional grid."""
+    chunks: list[xr.Dataset] = []
+    # Pinned cfgrib internally merges with the current no_conflicts default.
+    # It cannot accept a compat argument. Keep that behavior and silence only
+    # its known migration notice; our final merge sets compatibility explicitly.
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message="In a future version of xarray the default value for compat.*",
+            category=FutureWarning,
+            module=r"cfgrib\.xarray_store",
+        )
+        datasets = [
+            dataset
+            for file in grib_paths
+            for dataset in cfgrib.open_datasets(
+                str(file), backend_kwargs={"indexpath": ""}
+            )
+        ]
+    for ds in datasets:
+        try:
+            # Height/depth describe each variable, not a shared axis.
+            # Keeping scalar 2/10/100 m coordinates makes xr.merge
+            # reject otherwise compatible surface fields.
+            chunks.append(subset(regional_grib_field(ds), grid).load())
+        finally:
+            ds.close()
+    merged = xr.merge(chunks, compat="no_conflicts")
+    if kind == "single":
+        # cfgrib emits CDS-like short names for surface fields.
+        merged = merged.rename(
+            {
+                name: target
+                for name, target in IFS_SURFACE.items()
+                if name in merged and target not in merged
+            }
+        )
+        merged = merged.rename(
+            {
+                name: target
+                for name, target in (("st", "stl1"), ("swvl", "swvl1"))
+                if name in merged and target not in merged
+            }
+        )
+        if ice is not None:
+            merged["siconc"] = ice
+        missing = set(SURFACE) - set(merged.data_vars)
+        if missing:
+            raise ValueError(
+                f"Public IFS is missing required fields {sorted(missing)}; "
+                "live forecasting remains unavailable for this product"
+            )
+    if "time" not in merged.dims:
+        merged = merged.expand_dims(time=[np.datetime64(time, "ns")])
+    merged.attrs.update(source="ECMWF IFS step-zero cycles", experimental="true")
+    validate_ifs_units(merged, kind)
+    return merged

@@ -45,6 +45,9 @@ def select_cycle(config: Config, now: datetime, recorder: Recorder) -> datetime:
         except requests.HTTPError as error:
             if error.response is None or error.response.status_code != 404:
                 raise
+            LOGGER.info(
+                "IFS cycle %s UTC is not published; trying an older pair", cycle
+            )
             failures.append(f"{cycle.isoformat()}: not published")
             continue
         reports = audit["cycles"]
@@ -61,6 +64,25 @@ def select_cycle(config: Config, now: datetime, recorder: Recorder) -> datetime:
             return cycle
         failures.append(f"{cycle.isoformat()}: incomplete fields {reports}")
     raise ValueError("No complete fresh IFS input pair. " + "; ".join(failures))
+
+
+def available_cycle(config: Config, now: datetime, recorder: Recorder) -> datetime:
+    """Audit freshness before forecast reuse; cache selection for ten minutes."""
+    candidates = recent_cycles(now, config.max_input_age_hours)
+    bucket = int(now.timestamp()) // 600
+    path = (
+        config.root
+        / "outputs/availability"
+        / (f"ifs-{bucket}-{config.max_input_age_hours}.json")
+    )
+    if path.exists():
+        cycle = datetime.fromisoformat(json.loads(path.read_text())["cycle"])
+        if cycle in candidates:
+            return cycle
+    cycle = select_cycle(config, now, recorder)
+    if not path.exists():
+        write_json(path, {"cycle": cycle.isoformat(), "checked_utc": now.isoformat()})
+    return cycle
 
 
 def find_sea_ice(config: Config, cycle: datetime, recorder: Recorder) -> Path:
@@ -197,23 +219,12 @@ def predict_weather(
         minute=0, second=0, microsecond=0
     ) + timedelta(hours=1)
     end = (first + timedelta(hours=config.hours - 1)).replace(tzinfo=None)
-    dataset = None
-    cycle = None
-    for candidate in recent_cycles(now, config.max_input_age_hours):
-        horizon = int((end - candidate).total_seconds() / 3600)
-        if not 1 <= horizon <= 48:
-            continue
-        dataset = cached_grid(config, candidate, horizon, recorder)
-        if dataset is not None:
-            cycle = candidate
-            break
+    cycle = available_cycle(config, now, recorder)
+    horizon = int((end - cycle).total_seconds() / 3600)
+    if not 1 <= horizon <= 48:
+        raise ValueError("Requested window exceeds the 48-hour internal rollout limit")
+    dataset = cached_grid(config, cycle, horizon, recorder)
     if dataset is None:
-        cycle = select_cycle(config, now, recorder)
-        horizon = int((end - cycle).total_seconds() / 3600)
-        if not 1 <= horizon <= 48:
-            raise ValueError(
-                "Requested window exceeds the 48-hour internal rollout limit"
-            )
         ice = find_sea_ice(config, cycle, recorder)
         pull_ifs(config, cycle, recorder, ice)
         dataset = cached_grid(config, cycle, horizon, recorder)
@@ -231,8 +242,6 @@ def predict_weather(
             dataset.attrs["available_utc"] = datetime.now(UTC).isoformat()
             save_forecast(dataset, path)
             write_json(path.with_suffix(".json"), {"sha256": sha256(path), "key": key})
-    if cycle is None:
-        raise ValueError("Missing forecast initialization")
     result = query_grid(dataset, latitude, longitude, config.hours, start)
     if station_calibrator is not None:
         from aurora_finetuning.station_data import apply_live_stations
@@ -255,6 +264,49 @@ def predict_weather(
     result["initialization_age_hours"] = (
         now.astimezone(UTC).replace(tzinfo=None) - cycle
     ).total_seconds() / 3600
+    rows = result["hourly"]
+    if not isinstance(rows, list):
+        raise ValueError("Invalid forecast rows")
+    leads = [
+        (
+            datetime.fromisoformat(row["time"]).astimezone(UTC).replace(tzinfo=None)
+            - cycle
+        ).total_seconds()
+        / 3600
+        for row in rows
+    ]
+    result["model_lead_hours"] = leads
+    result["requested_components"] = {
+        "aurora": True,
+        "stations": station_calibrator is not None,
+        "radar": radar_adapter is not None,
+    }
+    result["variable_sources"] = {
+        name: sorted({str(row.get(f"{name}_source", "unknown")) for row in rows})
+        for name in (
+            "temperature_c",
+            "pressure_hpa",
+            "wind_u_ms",
+            "wind_v_ms",
+            "precipitation_mm",
+        )
+    }
+    LOGGER.info(
+        "Components requested: Aurora, stations=%s, radar=%s; model leads %s–%s h; "
+        "station cutoff=%s; radar cutoff=%s; actual sources=%s",
+        station_calibrator is not None,
+        radar_adapter is not None,
+        leads[0],
+        leads[-1],
+        result.get("station_cutoff_utc", "none"),
+        result.get("radar_cutoff_utc", "none"),
+        result["variable_sources"],
+    )
+    LOGGER.info(
+        "Correction identities (SHA256): stations=%s; radar=%s",
+        result.get("station_calibrator_sha256", "none"),
+        result.get("radar_adapter_sha256", "none"),
+    )
     LOGGER.warning(
         "Experimental Aurora forecast at ~25 km resolution; initialized %s UTC; "
         "input age %.1f hours",

@@ -139,7 +139,7 @@ def infer(
                 negative_count += count
                 minimum_raw = min(minimum_raw, minimum)
                 if count:
-                    LOGGER.warning(
+                    LOGGER.debug(
                         "Hour %s: floored %s negative precipitation cells; "
                         "raw minimum %.6f mm",
                         hour,
@@ -207,6 +207,13 @@ def infer(
         result[name].attrs["units"] = unit
     result.attrs["precision"] = config.precision
     result.temperature_c.attrs["units"] = "degC"
+    if negative_count:
+        LOGGER.warning(
+            "Floored %s negative rainfall cells across %s hours; minimum %.6f mm",
+            negative_count,
+            hours,
+            minimum_raw,
+        )
     result.precipitation_mm.attrs["units"] = "mm"
     return result
 

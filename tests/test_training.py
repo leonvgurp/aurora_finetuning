@@ -89,6 +89,9 @@ def test_exact_station_distance_and_missing_history() -> None:
     summary, usable = recent_features(ds, [], "temperature_c", cutoff, 52, 5, 60)
     assert usable and summary[6] == pytest.approx(0)
     assert summary[8] == 1  # No eligible previous forecast residual.
+    assert summary[-1] == pytest.approx(
+        float(ds.temperature_c.isel(time=-1, station=0))
+    )
     assert not recent_features(ds, [], "pressure_hpa", cutoff, 52, 5, 60)[1]
     assert not recent_features(
         ds, [], "temperature_c", cutoff + timedelta(hours=2), 52, 5, 60
